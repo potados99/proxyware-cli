@@ -5,15 +5,21 @@
 set -u
 
 # push <ns|host> <url> : netns(또는 호스트)에서 heartbeat GET을 보냅니다. 성공 시 0.
+# netns curl 이 일시적으로 실패할 수 있어 2회 재시도합니다(간헐 실패로 인한 flapping 방지).
 push() {
   ns="$1"; url="$2"
   [ -n "$url" ] || return 1
   if [ "$ns" = "host" ]; then pre=""; else pre="ip netns exec $ns"; fi
-  if command -v curl >/dev/null 2>&1; then
-    $pre curl -fsS -m 10 "$url" >/dev/null 2>&1
-  else
-    $pre busybox wget -q -T 10 -O /dev/null "$url" 2>/dev/null
-  fi
+  i=0
+  while [ "$i" -lt 2 ]; do
+    if command -v curl >/dev/null 2>&1; then
+      $pre curl -fsS -m 10 "$url" >/dev/null 2>&1 && return 0
+    else
+      $pre busybox wget -q -T 10 -O /dev/null "$url" 2>/dev/null && return 0
+    fi
+    i=$((i+1)); sleep 1
+  done
+  return 1
 }
 
 hb_url() { sed -n "s/^HEARTBEAT_URL=//p" "$1" 2>/dev/null | tr -d "\""; }
@@ -25,25 +31,21 @@ active_secs() {
   echo $(( up - ${mono:-0} / 1000000 ))
 }
 
-# pawns 헬스: "이번 기동(InvocationID)에서 터널이 실제로 섰는가(running)"로 판정합니다.
-#  - balance_ready 는 "서버 연결됨"일 뿐입니다. cant_open_port 로 터널을 못 열어도 계속 나오므로
-#    이것만으로 healthy 로 보면 스테일(running 미도달) 워커를 놓칩니다.
-#  - 이번 기동의 마지막 이벤트가 not_running 이면 재시작합니다.
-#  - 이번 기동에서 running 을 한 번도 못 봤고 3분이 넘었으면 불건강으로 보고 재시작합니다(push 안 함
-#    → heartbeat 가 끊겨 Kuma 가 down 으로 잡습니다). 3분 미만이면 기동 유예로 두되 push 는 보류합니다.
-#  - 이번 기동에서 running 을 봤으면 이후 조용해도 healthy 입니다.
+# pawns 헬스: 최근 30분의 running / not_running 두 이벤트만 보고 판정합니다(balance_ready는 노이즈라 무시).
+#  - 마지막이 running 이거나, 끊김(not_running)이 아예 없으면 → healthy(터널이 서 있거나 한 번도 안 끊김).
+#    (정상 워커는 not_running이 없으니 항상 healthy → 오탐/flapping 없음.)
+#  - 마지막이 not_running 이면 → 끊김 상태(또는 cant_open_port로 running 미도달). push 보류(→Kuma down)하고,
+#    5분 넘게 그 상태면 재시작합니다.
+# 이 방식은 InvocationID journalctl(부하 큼)을 안 써서 안정적입니다.
 check_pawns() {
   unit="$1"; ns="$2"; url="$3"
   systemctl is-active --quiet "$unit" || return 0
-  inv=$(systemctl show "$unit" -p InvocationID --value 2>/dev/null)
-  ev=$(journalctl -u "$unit" _SYSTEMD_INVOCATION_ID="$inv" -o cat 2>/dev/null | grep -oE "\"name\":\"[a-z_]+\"")
+  ev=$(journalctl -u "$unit" --since "-30min" -o cat 2>/dev/null | grep -oE '"name":"(running|not_running)"')
   case "$(printf '%s\n' "$ev" | tail -1)" in
-    *not_running*) systemctl restart "$unit"; return ;;
+    *not_running*)
+      [ "$(active_secs "$unit")" -ge 300 ] && systemctl restart "$unit"
+      return ;;   # 끊김이 마지막 → push 보류(Kuma down)
   esac
-  if ! printf '%s\n' "$ev" | grep -q '"name":"running"'; then
-    [ "$(active_secs "$unit")" -ge 180 ] && systemctl restart "$unit"
-    return   # running 미도달 → push 보류 → Kuma down
-  fi
   push "$ns" "$url" && echo "OK  $unit" || echo "PUSH_FAIL $unit"
 }
 
