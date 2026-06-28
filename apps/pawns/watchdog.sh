@@ -14,8 +14,8 @@ set -u
 UNIT="pawns.service"
 NOT_RUNNING_GRACE=300   # not_running이 이 시간(초) 넘게 지속되면 멈춘 것으로 보고 재시작합니다.
 
-# HEARTBEAT_URL을 읽어 옵니다. 없으면 핑은 생략합니다.
-[ -f /etc/default/pawns ] && . /etc/default/pawns
+# HEARTBEAT_URL 줄만 뽑아 옵니다(자격증명까지 통째로 source하지 않도록). 없으면 핑은 생략합니다.
+HEARTBEAT_URL="$(sed -n 's/^HEARTBEAT_URL=//p' /etc/default/pawns 2>/dev/null | tr -d '"')"
 
 # 서비스가 떠 있지 않으면 systemd가 알아서 하므로 여기서는 손대지 않습니다.
 [ "$(systemctl is-active "$UNIT" 2>/dev/null)" = "active" ] || exit 0

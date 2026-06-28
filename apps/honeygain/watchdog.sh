@@ -14,8 +14,8 @@ set -u
 UNIT="honeygain.service"
 ERROR_TAIL=10   # 최근 이만큼의 줄이 전부 오류면 오류 폭주로 봅니다.
 
-# HEARTBEAT_URL을 읽어 옵니다. 없으면 핑은 생략합니다.
-[ -f /etc/default/honeygain ] && . /etc/default/honeygain
+# HEARTBEAT_URL 줄만 뽑아 옵니다(자격증명까지 통째로 source하지 않도록). 없으면 핑은 생략합니다.
+HEARTBEAT_URL="$(sed -n 's/^HEARTBEAT_URL=//p' /etc/default/honeygain 2>/dev/null | tr -d '"')"
 
 # 서비스가 실패 상태(죽음)인 경우
 if [ "$(systemctl is-active "$UNIT" 2>/dev/null)" != "active" ]; then
