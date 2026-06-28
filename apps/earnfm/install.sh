@@ -30,7 +30,8 @@ esac; done
 need_root
 
 # 런타임 설치 — tarball 안에 earnfm 실행 파일이 들어 있습니다.
-[ -n "$ARG_RUNTIME" ] || { echo "--runtime 이 필요합니다 (extract.sh 산출물)." >&2; exit 1; }
+# --runtime 미지정 시 GitHub Release에서 자동으로 받습니다 (arm64).
+[ -n "$ARG_RUNTIME" ] || ARG_RUNTIME="https://github.com/$REPO/releases/download/runtimes-arm64/earnfm-runtime-arm64.tar.gz"
 tb="$(mktemp)"
 case "$ARG_RUNTIME" in
     http://*|https://*) fetch "$tb" "$ARG_RUNTIME" ;;

@@ -35,7 +35,8 @@ need_root
 
 # 런타임 설치 — tarball 안에 honeygain 실행 파일과 .so 두 개가 들어 있습니다.
 # 한 폴더(/opt/honeygain)에 같이 풀고, 서비스에서 LD_LIBRARY_PATH로 잡습니다.
-[ -n "$ARG_RUNTIME" ] || { echo "--runtime 이 필요합니다 (extract.sh 산출물)." >&2; exit 1; }
+# --runtime 미지정 시 GitHub Release에서 자동으로 받습니다 (arm64).
+[ -n "$ARG_RUNTIME" ] || ARG_RUNTIME="https://github.com/$REPO/releases/download/runtimes-arm64/honeygain-runtime-arm64.tar.gz"
 mkdir -p "$PREFIX"
 tb="$(mktemp)"
 case "$ARG_RUNTIME" in
