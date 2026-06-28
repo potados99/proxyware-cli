@@ -18,16 +18,22 @@ push() {
 
 hb_url() { sed -n "s/^HEARTBEAT_URL=//p" "$1" 2>/dev/null | tr -d "\""; }
 
-# pawns: active + 최근 6분 내 마지막 lifecycle event가 not_running이 아니면 healthy.
-# not_running으로 끝나면(터널 끊김 지속) 재시작하고 이번엔 push 안 함.
+# pawns 헬스: 터널이 실제로 섰는가(running)로 판정한다.
+#  - balance_ready 는 "서버 연결됨"일 뿐, cant_open_port 로 터널(running) 못 열어도 계속 나온다 → healthy 아님.
+#  - 최근 6분 마지막이 not_running → 재시작.
+#  - 최근 6분에 not_running 이 있는데 running 을 한 번도 못 봤으면(터널 거부 지속) → 재시작, push 안 함.
+#  - 그 외(running 봤거나 조용함) → healthy.
 check_pawns() {
   unit="$1"; ns="$2"; url="$3"
   systemctl is-active --quiet "$unit" || return 0
-  last=$(journalctl -u "$unit" --since "-6min" -o cat 2>/dev/null | grep -oE "\"name\":\"[a-z_]+\"" | tail -1)
-  case "$last" in
-    *not_running*) systemctl restart "$unit" ;;
-    *) push "$ns" "$url" && echo "OK  $unit" || echo "PUSH_FAIL $unit" ;;
+  ev=$(journalctl -u "$unit" --since "-6min" -o cat 2>/dev/null | grep -oE "\"name\":\"[a-z_]+\"")
+  case "$(printf '%s\n' "$ev" | tail -1)" in
+    *not_running*) systemctl restart "$unit"; return ;;
   esac
+  if printf '%s\n' "$ev" | grep -q not_running && ! printf '%s\n' "$ev" | grep -q '"name":"running"'; then
+    systemctl restart "$unit"; return   # 터널 거부 지속 → unhealthy (push 안 함 = Kuma down)
+  fi
+  push "$ns" "$url" && echo "OK  $unit" || echo "PUSH_FAIL $unit"
 }
 
 # earnfm: active면 healthy (조용함은 정상, Restart=always가 죽으면 살림).
