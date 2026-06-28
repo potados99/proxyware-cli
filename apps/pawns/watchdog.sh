@@ -14,6 +14,9 @@ set -u
 UNIT="pawns.service"
 NOT_RUNNING_GRACE=300   # not_running이 이 시간(초) 넘게 지속되면 멈춘 것으로 보고 재시작합니다.
 
+# HEARTBEAT_URL을 읽어 옵니다. 없으면 핑은 생략합니다.
+[ -f /etc/default/pawns ] && . /etc/default/pawns
+
 # 서비스가 떠 있지 않으면 systemd가 알아서 하므로 여기서는 손대지 않습니다.
 [ "$(systemctl is-active "$UNIT" 2>/dev/null)" = "active" ] || exit 0
 
@@ -44,4 +47,9 @@ if [ -z "$LAST_EVT" ] && [ "$UP" -gt 180 ]; then
 fi
 
 # 최근 이벤트가 running 이거나, 막 시작해서(180초 미만) 아직 이벤트가 없는 경우 → 정상입니다.
+# 정상이므로 핑을 보냅니다.
+if [ -n "${HEARTBEAT_URL:-}" ]; then
+    if command -v curl >/dev/null 2>&1; then curl -fsS -m 10 "$HEARTBEAT_URL" >/dev/null 2>&1 || true
+    else wget -qO- -T 10 "$HEARTBEAT_URL" >/dev/null 2>&1 || true; fi
+fi
 exit 0
