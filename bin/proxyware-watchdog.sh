@@ -36,12 +36,20 @@ check_earnfm() {
   systemctl is-active --quiet "$unit" && { push "$ns" "$url" && echo "OK  $unit" || echo "PUSH_FAIL $unit"; }
 }
 
+# honeygain: active면 healthy. device_limit(exit 1)면 inactive로 멈춰있고
+# RestartPreventExitStatus=1 이라 다시 안 살린다 → push 안 함(Kuma가 down 표시).
+check_honeygain() {
+  unit="$1"; ns="$2"; url="$3"
+  systemctl is-active --quiet "$unit" && { push "$ns" "$url" && echo "OK  $unit" || echo "PUSH_FAIL $unit"; }
+}
+
 # 워커: /etc/default/pawns-worker<id> 가 있는 모든 id를 발견해서 점검
 for f in /etc/default/pawns-worker*; do
   [ -e "$f" ] || continue
   id="${f##*/pawns-worker}"
   check_pawns  "pawns-worker@$id"  "w$id" "$(hb_url /etc/default/pawns-worker$id)"
   check_earnfm "earnfm-worker@$id" "w$id" "$(hb_url /etc/default/earnfm-worker$id)"
+  [ -e /etc/default/honeygain-worker$id ] && check_honeygain "honeygain-worker@$id" "w$id" "$(hb_url /etc/default/honeygain-worker$id)"
 done
 
 # 호스트 자신을 워커로 쓰는 경우 (host)

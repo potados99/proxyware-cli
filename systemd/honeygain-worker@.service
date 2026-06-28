@@ -1,0 +1,29 @@
+[Unit]
+Description=honeygain worker %i
+Requires=worker-net@%i.service
+After=worker-net@%i.service worker-dhcp@%i.service
+# device_limit(exit 1) 시 재시작 폭주를 막기 위한 제한.
+StartLimitIntervalSec=600
+StartLimitBurst=5
+
+[Service]
+Slice=proxyware.slice
+NetworkNamespacePath=/run/netns/w%i
+EnvironmentFile=/etc/default/honeygain-worker%i
+# 의존 라이브러리(libhg, libmsquic)를 바이너리 옆에서 찾도록.
+Environment=LD_LIBRARY_PATH=/opt/honeygain
+WorkingDirectory=/opt/honeygain
+ExecStartPre=/bin/sh -c "for i in $(seq 30); do ip -4 addr show eth0 | grep -q \"inet \" && exit 0; sleep 1; done; exit 1"
+ExecStart=/opt/honeygain/honeygain -email ${EMAIL} -pass ${PASSWORD} -device ${DEVICE_NAME} -tou-accept
+# 종료코드 1(디바이스 한도 초과)이면 재시작 안 함 (ghost 세션 충돌 방지).
+Restart=on-failure
+RestartPreventExitStatus=1
+RestartSec=60
+ProtectHostname=yes
+PrivatePIDs=yes
+PrivateTmp=yes
+NoNewPrivileges=yes
+BindReadOnlyPaths=/etc/proxyware/resolv.conf:/etc/resolv.conf
+
+[Install]
+WantedBy=multi-user.target

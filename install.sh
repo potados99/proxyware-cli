@@ -39,12 +39,23 @@ put() {  # put <src-상대경로> <dest> [mode]
     else fetch "$dest" "$BASE_URL/$src"; chmod "$mode" "$dest"; fi
 }
 
-# pawns/earnfm 바이너리가 없으면 Release에서 받습니다 (arm64).
-ensure_runtime() {  # ensure_runtime <pawns|earnfm>
-    local app="$1"; [ -x "$BIN/$app" ] && return 0
-    local tb; tb="$(mktemp)"
-    fetch "$tb" "$REL_URL/$app-runtime-arm64.tar.gz"
-    tar -C "$BIN" -xzf "$tb"; rm -f "$tb"; chmod +x "$BIN/$app"
+# 바이너리가 없으면 Release에서 받습니다 (arm64).
+# honeygain은 동적 링크(.so 동봉)라 /opt/honeygain에 통째로 풉니다.
+ensure_runtime() {  # ensure_runtime <pawns|earnfm|honeygain>
+    local app="$1" tb
+    case "$app" in
+    honeygain)
+        [ -x /opt/honeygain/honeygain ] && return 0
+        mkdir -p /opt/honeygain
+        tb="$(mktemp)"; fetch "$tb" "$REL_URL/honeygain-runtime-arm64.tar.gz"
+        tar -C /opt/honeygain -xzf "$tb"; rm -f "$tb"; chmod +x /opt/honeygain/honeygain
+        ;;
+    *)
+        [ -x "$BIN/$app" ] && return 0
+        tb="$(mktemp)"; fetch "$tb" "$REL_URL/$app-runtime-arm64.tar.gz"
+        tar -C "$BIN" -xzf "$tb"; rm -f "$tb"; chmod +x "$BIN/$app"
+        ;;
+    esac
 }
 
 # 공통 토대: 스크립트/유닛/워치독 + NM 영구화. 멱등이라 여러 번 호출해도 안전합니다.
@@ -55,7 +66,7 @@ ensure_base() {  # ensure_base <parent-nic>
     put net/proxyns-down      "$SBIN/proxyns-down"          755
     put net/udhcpc.script     "$PROX_DIR/udhcpc.script"     755
     put net/resolv.conf       "$PROX_DIR/resolv.conf"       644
-    for u in worker-net@ worker-dhcp@ pawns-worker@ earnfm-worker@; do
+    for u in worker-net@ worker-dhcp@ pawns-worker@ earnfm-worker@ honeygain-worker@; do
         put "systemd/$u.service" "$UNIT/$u.service"
     done
     put systemd/proxyware.slice              "$UNIT/proxyware.slice"
@@ -86,20 +97,25 @@ CMD="$1"; shift
 ID=""; MAC=""; PARENT="eth0"
 P_EMAIL=""; P_PASS=""; P_DEVID=""; P_DEVNAME=""; E_TOKEN=""
 P_HB=""; E_HB=""; KUMA_URL=""; KUMA_USER=""; KUMA_PASS=""
+HG_EMAIL=""; HG_PASS=""; HG_DEV=""; HG_HB=""
 while [ $# -gt 0 ]; do case "$1" in
-    --id)           ID="$2"; shift 2 ;;
-    --mac)          MAC="$2"; shift 2 ;;
-    --parent)       PARENT="$2"; shift 2 ;;
-    --pawns-email)  P_EMAIL="$2"; shift 2 ;;
-    --pawns-pass)   P_PASS="$2"; shift 2 ;;
-    --device-id)    P_DEVID="$2"; shift 2 ;;
-    --device-name)  P_DEVNAME="$2"; shift 2 ;;
-    --earnfm-token) E_TOKEN="$2"; shift 2 ;;
-    --pawns-hb)     P_HB="$2"; shift 2 ;;
-    --earnfm-hb)    E_HB="$2"; shift 2 ;;
-    --kuma-url)     KUMA_URL="$2"; shift 2 ;;
-    --kuma-user)    KUMA_USER="$2"; shift 2 ;;
-    --kuma-pass)    KUMA_PASS="$2"; shift 2 ;;
+    --id)              ID="$2"; shift 2 ;;
+    --mac)             MAC="$2"; shift 2 ;;
+    --parent)          PARENT="$2"; shift 2 ;;
+    --pawns-email)     P_EMAIL="$2"; shift 2 ;;
+    --pawns-pass)      P_PASS="$2"; shift 2 ;;
+    --device-id)       P_DEVID="$2"; shift 2 ;;
+    --device-name)     P_DEVNAME="$2"; shift 2 ;;
+    --earnfm-token)    E_TOKEN="$2"; shift 2 ;;
+    --honeygain-email) HG_EMAIL="$2"; shift 2 ;;
+    --honeygain-pass)  HG_PASS="$2"; shift 2 ;;
+    --honeygain-device) HG_DEV="$2"; shift 2 ;;
+    --pawns-hb)        P_HB="$2"; shift 2 ;;
+    --earnfm-hb)       E_HB="$2"; shift 2 ;;
+    --honeygain-hb)    HG_HB="$2"; shift 2 ;;
+    --kuma-url)        KUMA_URL="$2"; shift 2 ;;
+    --kuma-user)       KUMA_USER="$2"; shift 2 ;;
+    --kuma-pass)       KUMA_PASS="$2"; shift 2 ;;
     *) echo "모르는 옵션: $1" >&2; exit 1 ;;
 esac; done
 
@@ -130,7 +146,20 @@ HEARTBEAT_URL=$E_HB"
 
     systemctl enable --now "worker-net@$ID" "worker-dhcp@$ID"
     systemctl enable --now "pawns-worker@$ID" "earnfm-worker@$ID"
-    echo "완료: worker$ID — systemctl status pawns-worker@$ID earnfm-worker@$ID"
+
+    # honeygain (선택): --honeygain-email 을 주면 같은 IP에 함께 띄웁니다.
+    if [ -n "$HG_EMAIL" ]; then
+        ensure_runtime honeygain
+        : "${HG_DEV:=$P_DEVID}"
+        write_env "/etc/default/honeygain-worker$ID" "EMAIL=$HG_EMAIL
+PASSWORD=$HG_PASS
+DEVICE_NAME=$HG_DEV
+HEARTBEAT_URL=$HG_HB"
+        systemctl enable --now "honeygain-worker@$ID"
+        echo "완료: worker$ID — pawns + earnfm + honeygain"
+    else
+        echo "완료: worker$ID — pawns + earnfm"
+    fi
     ;;
 host)
     # 호스트 자신을 워커로 (netns 없이 호스트 기본 네트워크로 나감).
