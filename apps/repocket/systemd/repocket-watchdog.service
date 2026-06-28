@@ -1,0 +1,7 @@
+[Unit]
+Description=repocket watchdog (헬스체크 1회 실행)
+Documentation=https://github.com/potados99/proxyware-cli
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/repocket-watchdog.sh

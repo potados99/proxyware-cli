@@ -1,0 +1,15 @@
+[Unit]
+Description=earnfm (대역폭 공유)
+Documentation=https://github.com/potados99/proxyware-cli
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+EnvironmentFile=/etc/default/earnfm
+ExecStart=/usr/local/bin/earnfm
+Restart=always
+RestartSec=30
+
+[Install]
+WantedBy=multi-user.target
