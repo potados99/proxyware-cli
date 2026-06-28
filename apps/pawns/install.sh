@@ -18,7 +18,7 @@ HERE="$(cd "$(dirname "$0")" 2>/dev/null && pwd || true)"
 if [ -n "$HERE" ] && [ -f "$HERE/../../lib/common.sh" ]; then
     . "$HERE/../../lib/common.sh"
 else
-    . <(curl -fsSL "$BASE_URL/lib/common.sh")
+    if command -v curl >/dev/null 2>&1; then . <(curl -fsSL "$BASE_URL/lib/common.sh"); else . <(wget -qO- "$BASE_URL/lib/common.sh"); fi
 fi
 
 ARG_RUNTIME=""; ARG_EMAIL=""; ARG_PASSWORD=""; ARG_DEVICE=""; ARG_DEVICE_ID=""
