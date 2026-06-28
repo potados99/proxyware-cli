@@ -18,7 +18,7 @@ api.login(a.user, a.password)
 try:
     mon = next((m for m in api.get_monitors() if m["name"] == a.name), None)
     if mon is None:
-        # v2는 conditions=[] 를 요구한다 (스킬 기록 참조).
+        # v2는 conditions=[] 를 요구합니다(스킬 기록 참조).
         r = api.add_monitor(type=MonitorType.PUSH, name=a.name,
                             interval=a.interval, conditions=[])
         mon = api.get_monitor(r["monitorID"])

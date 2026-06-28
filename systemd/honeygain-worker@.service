@@ -4,7 +4,7 @@ Requires=worker-net@%i.service
 After=worker-net@%i.service worker-dhcp@%i.service
 # exit 1(device 충돌/한도) 재시작 폭주 제한: 600초에 5회 실패하면 정지(failed).
 # 재부팅 후 stale 세션(device already active)은 60초 재시도로 풀려 자동 복구되고,
-# 진짜 device_limit는 5회 후 정지(Kuma down)한다.
+# 진짜 device_limit는 5회 후 정지합니다(Kuma down).
 StartLimitIntervalSec=600
 StartLimitBurst=5
 
@@ -18,8 +18,8 @@ Environment=LD_LIBRARY_PATH=/opt/honeygain
 WorkingDirectory=/opt/honeygain
 ExecStartPre=/bin/sh -c "for i in $(seq 30); do ip -4 addr show eth0 | grep -q \"inet \" && exit 0; sleep 1; done; exit 1"
 ExecStart=/opt/honeygain/honeygain -email ${EMAIL} -pass ${PASSWORD} -device ${DEVICE_NAME} -tou-accept
-# exit 1(device already active / 한도)도 재시도한다 — 재부팅 후 stale 세션이
-# 만료되면 60초 주기 재시도로 자동 복구되게. 폭주는 위 StartLimit가 막는다.
+# exit 1(device already active / 한도)도 재시도합니다 — 재부팅 후 stale 세션이
+# 만료되면 60초 주기 재시도로 자동 복구되게. 폭주는 위 StartLimit가 막습니다.
 Restart=on-failure
 RestartSec=60
 ProtectHostname=yes
