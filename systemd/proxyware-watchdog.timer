@@ -2,8 +2,8 @@
 Description=proxyware 워치독 5분 주기
 
 [Timer]
-OnBootSec=2min
-OnUnitActiveSec=5min
+OnBootSec=1min
+OnUnitActiveSec=1min
 AccuracySec=10s
 
 [Install]
