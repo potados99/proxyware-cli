@@ -6,6 +6,7 @@ StartLimitIntervalSec=0
 
 [Service]
 Slice=proxyware.slice
+IPAccounting=yes
 NetworkNamespacePath=/run/netns/w%i
 EnvironmentFile=/etc/default/pawns-worker%i
 Environment=HOME=/tmp

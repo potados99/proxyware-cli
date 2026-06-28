@@ -5,6 +5,7 @@ Wants=network-online.target
 StartLimitIntervalSec=0
 
 [Service]
+IPAccounting=yes
 EnvironmentFile=/etc/default/pawns-host
 Environment=HOME=/tmp
 ExecStart=/usr/local/bin/pawns -email=${EMAIL} -password=${PASSWORD} -device-name=${DEVICE_NAME} -device-id=${DEVICE_ID} -accept-tos

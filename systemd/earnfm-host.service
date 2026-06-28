@@ -5,6 +5,7 @@ Wants=network-online.target
 StartLimitIntervalSec=0
 
 [Service]
+IPAccounting=yes
 EnvironmentFile=/etc/default/earnfm-host
 ExecStart=/usr/local/bin/earnfm
 Restart=always
