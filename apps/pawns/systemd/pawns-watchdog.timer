@@ -1,0 +1,11 @@
+[Unit]
+Description=pawns watchdog (5분마다 실행)
+Documentation=https://github.com/potados99/proxyware-cli
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=5min
+AccuracySec=10s
+
+[Install]
+WantedBy=timers.target

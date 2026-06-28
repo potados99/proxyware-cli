@@ -33,9 +33,27 @@ case "$APP" in
         docker rm "$cid" >/dev/null
         tar -C "$tmp" -czf "$OUT" node app
         ;;
-    pawns|honeygain)
-        echo "TODO: $APP 추출 경로는 이미지 구조 확인 후 채웁니다." >&2
-        exit 1
+    pawns)
+        # pawns는 정적 링크 단일 바이너리라 entrypoint(/pawns-cli) 하나만 뽑으면 됩니다.
+        IMAGE="iproyal/pawns-cli:latest"
+        docker pull "$IMAGE" >/dev/null
+        cid="$(docker create "$IMAGE")"
+        docker cp "$cid:/pawns-cli" "$tmp/pawns"
+        docker rm "$cid" >/dev/null
+        tar -C "$tmp" -czf "$OUT" pawns
+        ;;
+    honeygain)
+        # honeygain은 동적 링크라 실행 파일(/app/honeygain)과 의존 라이브러리 두 개를
+        # 함께 뽑습니다. honeygain은 libhg.so.2.0.0을 직접 링크하고, libhg는 다시
+        # libmsquic.so.2를 필요로 합니다. 둘 다 이미지의 /usr/lib에 있습니다.
+        IMAGE="honeygain/honeygain:latest"
+        docker pull "$IMAGE" >/dev/null
+        cid="$(docker create "$IMAGE")"
+        docker cp "$cid:/app/honeygain" "$tmp/honeygain"
+        docker cp "$cid:/usr/lib/libhg.so.2.0.0" "$tmp/libhg.so.2.0.0"
+        docker cp "$cid:/usr/lib/libmsquic.so.2" "$tmp/libmsquic.so.2"
+        docker rm "$cid" >/dev/null
+        tar -C "$tmp" -czf "$OUT" honeygain libhg.so.2.0.0 libmsquic.so.2
         ;;
     *)
         echo "모르는 앱: $APP" >&2; exit 1

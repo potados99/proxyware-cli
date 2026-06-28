@@ -1,0 +1,26 @@
+[Unit]
+Description=honeygain (대역폭 공유)
+Documentation=https://github.com/potados99/proxyware-cli
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=600
+StartLimitBurst=5
+
+[Service]
+EnvironmentFile=/etc/default/honeygain
+# 의존 라이브러리(libhg, libmsquic)를 바이너리 옆에서 찾도록 경로를 잡아 줍니다.
+Environment=LD_LIBRARY_PATH=/opt/honeygain
+WorkingDirectory=/opt/honeygain
+ExecStart=/opt/honeygain/honeygain \
+    -email ${EMAIL} \
+    -pass ${PASSWORD} \
+    -device ${DEVICE_NAME} \
+    -tou-accept
+# 종료코드 1(디바이스 한도 초과 등)이면 재시작하지 않습니다.
+# 한도 초과 상태에서 재시작하면 ghost 세션 충돌로 더 망가집니다.
+Restart=on-failure
+RestartPreventExitStatus=1
+RestartSec=60
+
+[Install]
+WantedBy=multi-user.target
