@@ -1,0 +1,5 @@
+#!/bin/sh
+# proxyns-down <id> : 워커 네임스페이스(w<id>)를 제거합니다.
+# 네임스페이스를 지우면 그 안의 macvlan 인터페이스도 함께 사라집니다.
+id="$1"; ns="w$id"
+ip netns del "$ns" 2>/dev/null || true

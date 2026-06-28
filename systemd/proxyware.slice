@@ -1,0 +1,12 @@
+[Unit]
+Description=proxyware 묶음 (메모리 통제 경계)
+
+# 워커 프로세스를 한 slice에 모아둡니다. 메모리 cgroup이 활성화된 호스트라면
+# 아래 상한이 적용되어, proxyware 총합이 한도를 넘어도 그 안에서만 reclaim/OOM이
+# 일어나고 호스트 나머지(sshd 등)는 보호됩니다.
+# 라즈베리파이는 기본 커널에서 memory cgroup이 꺼져 있어(cmdline `cgroup_disable=memory`)
+# 이 상한이 무시됩니다. 켜려면 cmdline에서 그 옵션을 빼고 재부팅해야 합니다.
+[Slice]
+MemoryHigh=560M
+MemoryMax=620M
+MemorySwapMax=2G

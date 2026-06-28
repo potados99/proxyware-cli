@@ -1,0 +1,20 @@
+#!/bin/sh
+# proxyns-up <id> <mac> [parent]
+# 워커용 네트워크 네임스페이스(w<id>)를 만들고, 부모 NIC(기본 eth0) 위에
+# macvlan 인터페이스를 <mac>으로 얹어 그 네임스페이스 안 eth0로 옮깁니다.
+# 같은 MAC을 쓰면 DHCP에서 같은 공인 IP를 그대로 받습니다 (IP 보존).
+set -e
+id="$1"; mac="$2"; parent="${3:-eth0}"
+ns="w$id"; mv="mv$id"
+
+# 부모 NIC은 NetworkManager에서 unmanaged라 직접 올립니다 (멱등).
+ip link set "$parent" up 2>/dev/null || true
+
+ip netns add "$ns" 2>/dev/null || true
+ip link del "$mv" 2>/dev/null || true
+ip link add "$mv" link "$parent" type macvlan mode bridge
+ip link set "$mv" address "$mac"
+ip link set "$mv" netns "$ns"
+ip netns exec "$ns" ip link set "$mv" name eth0
+ip netns exec "$ns" ip link set lo up
+ip netns exec "$ns" ip link set eth0 up

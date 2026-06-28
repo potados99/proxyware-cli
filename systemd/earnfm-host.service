@@ -1,0 +1,14 @@
+[Unit]
+Description=earnfm (호스트)
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+EnvironmentFile=/etc/default/earnfm-host
+ExecStart=/usr/local/bin/earnfm
+Restart=always
+RestartSec=30
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,26 @@
+[Unit]
+Description=pawns worker %i
+Requires=worker-net@%i.service
+After=worker-net@%i.service worker-dhcp@%i.service
+StartLimitIntervalSec=0
+
+[Service]
+Slice=proxyware.slice
+NetworkNamespacePath=/run/netns/w%i
+EnvironmentFile=/etc/default/pawns-worker%i
+Environment=HOME=/tmp
+# netns에 IP가 붙을 때까지 최대 30초 기다립니다 (DHCP 완료 대기).
+ExecStartPre=/bin/sh -c "for i in $(seq 30); do ip -4 addr show eth0 | grep -q \"inet \" && exit 0; sleep 1; done; exit 1"
+ExecStart=/usr/local/bin/pawns -email=${EMAIL} -password=${PASSWORD} -device-name=${DEVICE_NAME} -device-id=${DEVICE_ID} -accept-tos
+Restart=always
+RestartSec=30
+# 공짜로 켤 수 있는 격리는 전부 적용합니다 (메모리 비용 ≈ 0).
+ProtectHostname=yes
+PrivatePIDs=yes
+PrivateTmp=yes
+NoNewPrivileges=yes
+# netns 안에서는 공인 DNS를 봐야 합니다 (호스트 사설 DNS는 도달 불가).
+BindReadOnlyPaths=/etc/proxyware/resolv.conf:/etc/resolv.conf
+
+[Install]
+WantedBy=multi-user.target

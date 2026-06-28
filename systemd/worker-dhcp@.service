@@ -1,0 +1,13 @@
+[Unit]
+Description=worker %i DHCP
+Requires=worker-net@%i.service
+After=worker-net@%i.service
+
+[Service]
+NetworkNamespacePath=/run/netns/w%i
+ExecStart=/usr/bin/busybox udhcpc -i eth0 -s /etc/proxyware/udhcpc.script -f
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

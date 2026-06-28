@@ -1,0 +1,6 @@
+[Unit]
+Description=proxyware 통합 워치독 (헬스체크 + Kuma heartbeat)
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/proxyware-watchdog.sh

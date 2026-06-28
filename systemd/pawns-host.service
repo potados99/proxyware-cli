@@ -1,0 +1,15 @@
+[Unit]
+Description=pawns (호스트)
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+EnvironmentFile=/etc/default/pawns-host
+Environment=HOME=/tmp
+ExecStart=/usr/local/bin/pawns -email=${EMAIL} -password=${PASSWORD} -device-name=${DEVICE_NAME} -device-id=${DEVICE_ID} -accept-tos
+Restart=always
+RestartSec=30
+
+[Install]
+WantedBy=multi-user.target

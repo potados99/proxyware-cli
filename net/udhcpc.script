@@ -1,0 +1,16 @@
+#!/bin/sh
+# busybox udhcpc 콜백 스크립트. 받은 임대 정보를 인터페이스에 적용합니다.
+# netns 안에서 udhcpc가 부르며, $interface/$ip/$subnet/$router 환경변수를 넘겨받습니다.
+mask2cidr() { c=0; for o in $(echo "$1" | tr . " "); do case $o in
+  255)c=$((c+8));;254)c=$((c+7));;252)c=$((c+6));;248)c=$((c+5));;
+  240)c=$((c+4));;224)c=$((c+3));;192)c=$((c+2));;128)c=$((c+1));;0);; esac; done; echo $c; }
+case "$1" in
+  deconfig) ip addr flush dev "$interface" ;;
+  bound|renew)
+    pfx=$(mask2cidr "${subnet:-255.255.255.0}")
+    ip addr flush dev "$interface"
+    ip addr add "$ip/$pfx" dev "$interface"
+    [ -n "$router" ] && ip route replace default via "$router" dev "$interface"
+    echo "DHCP_RESULT ip=$ip subnet=$subnet router=$router dns=$dns"
+    ;;
+esac

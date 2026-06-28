@@ -1,0 +1,15 @@
+[Unit]
+Description=worker %i 네트워크 (netns + macvlan)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# w%i.netconf 에서 MAC(필수)과 PARENT(선택, 기본 eth0)를 읽습니다.
+EnvironmentFile=/etc/proxyware/w%i.netconf
+ExecStart=/usr/local/sbin/proxyns-up %i ${MAC} ${PARENT}
+ExecStop=/usr/local/sbin/proxyns-down %i
+
+[Install]
+WantedBy=multi-user.target
