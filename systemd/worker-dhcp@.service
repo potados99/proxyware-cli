@@ -8,6 +8,9 @@ NetworkNamespacePath=/run/netns/w%i
 ExecStart=/usr/bin/busybox udhcpc -i eth0 -s /etc/proxyware/udhcpc.script -f
 Restart=always
 RestartSec=10
+# udhcpc가 SIGTERM에 굼떠서 stop이 길어지는 걸 막습니다 (바로 KILL).
+KillSignal=SIGKILL
+TimeoutStopSec=5
 
 [Install]
 WantedBy=multi-user.target
