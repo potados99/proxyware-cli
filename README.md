@@ -9,9 +9,9 @@
 ```
 apps/<앱>/install.sh        # 설치
 apps/<앱>/watchdog.sh       # 헬스체크
+apps/<앱>/extract.sh        # Docker 있는 곳에서 런타임 추출
 apps/<앱>/systemd/          # 서비스 + watchdog 유닛
 lib/common.sh              # install 공통 함수
-extract.sh                 # Docker 있는 곳에서 런타임 추출
 ```
 
 ## 쓰는 법
@@ -19,7 +19,7 @@ extract.sh                 # Docker 있는 곳에서 런타임 추출
 1. Docker 있는 기기에서 런타임을 한 번 뽑습니다.
 
 ```sh
-./extract.sh <앱>          # -> <앱>-runtime-<arch>.tar.gz
+./apps/<앱>/extract.sh     # -> <앱>-runtime-<arch>.tar.gz
 ```
 
 2. 대상 기기에서 설치합니다.
