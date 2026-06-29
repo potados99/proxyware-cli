@@ -1,11 +1,23 @@
 #!/bin/sh
-# 호스트+워커 통합 워치독입니다: 헬스 판정 후 Kuma heartbeat를 push합니다.
-# 워커는 netns 안에서 push하여 그 공인 IP의 실제 연결까지 검증합니다.
-# 워커 목록은 /etc/default/pawns-worker* 에서 자동으로 발견합니다(수량 하드코딩 없음).
+# 호스트+워커 통합 워치독: 헬스 판정 후 Kuma heartbeat를 push하고, unhealthy면 점진적 백오프로 재시작한다.
+# 워커는 netns 안에서 push하여 그 공인 IP의 실제 연결까지 검증한다.
+# 워커 목록은 /etc/default/pawns-worker* 에서 자동 발견한다(수량 하드코딩 없음).
+#
+# 구조: 벤더별 룰은 "healthy 판정"만 선언하고(아래 *_health 함수), 복구는 공통 엔진(handle)이 담당한다.
+#   판정값: healthy(정상) | unhealthy(재시작 대상) | grace(유예 — 재시작도 push도 보류) | skip(워치독 관여 안 함)
+#
+# 점진적 백오프(2026-06-29 도입): 재시작해도 안 살아나는 워커를 1분마다 영원히 때리면 오히려 벤더 서버측
+#   등록을 꼬이게 만든다(실측: pawns 워커를 천천히/간격을 두고 재시작해야 running 복귀). 그래서 unhealthy가
+#   지속되면 재시작 간격을 1→2→5→10→30분으로 늘린다. healthy 도달 즉시 백오프를 리셋한다.
+#   상태는 /run(tmpfs)에 워커별로 저장 — 재부팅 시 깨끗.
 set -u
 
-# push <ns|host> <url> : netns(또는 호스트)에서 heartbeat GET을 보냅니다. 성공 시 0.
-# netns curl 이 일시적으로 실패할 수 있어 2회 재시도합니다(간헐 실패로 인한 flapping 방지).
+STATE_DIR=/run/proxyware-wd
+mkdir -p "$STATE_DIR" 2>/dev/null
+
+EARNFM_RSS_MAX_KB=131072   # 128 MiB. earnfm(dart) 힙 폭주 회수 기준(정상 plateau 60~120MB, 폭주 150MB+).
+
+# push <ns|host> <url>: netns(또는 호스트)에서 heartbeat GET. 성공 시 0. 간헐 실패 대비 2회 재시도.
 push() {
   ns="$1"; url="$2"
   [ -n "$url" ] || return 1
@@ -24,103 +36,94 @@ push() {
 
 hb_url() { sed -n "s/^HEARTBEAT_URL=//p" "$1" 2>/dev/null | tr -d "\""; }
 
-# RSS 가드: proxyware 프로세스가 임계치를 연속 2회(=약 2분) 넘으면 재시작해 메모리를 회수합니다.
-# Pi 커널은 cgroup_disable=memory라 systemd MemoryMax가 무효 → MainPID의 VmRSS로 직접 판정합니다.
-# earnfm(dart VM) 힙은 트래픽 처리 후 부푸는데(소켓 누수 아님), dart GC가 spike 후 스스로 OS에 반환한다
-# (155MB까지 갔다가 12MB로 자가회수하는 것을 실측). 그래서 단발 측정 즉시 재시작하면 곧 자가회수될
-# spike를 성급히 끊는다 → /run(tmpfs) 플래그로 "직전 비트도 초과"였을 때만 재시작한다(첫 초과는 1비트 유예).
-# 자가회수 실패로 정말 고착된 누수만 회수된다. Kuma엔 보고 안 하고 journal에만 남긴다(사후 추적).
-# 반환 0 = 재시작함(이번 사이클 push 스킵), 1 = 정상/유예(이어서 check_* 수행).
-# 임계 128MiB 근거: earnfm 자연 spike는 ~155MB까지 가나 대부분 90~120MB에서 자가회수. 128MiB+연속2회로
-# 일시 spike는 면제하고 고착만 잡는다. pawns(7~20MB)/honeygain(36~67MB)은 안 걸림.
-MEM_LIMIT_KB=131072   # 128 MiB
-mem_guard() {
-  unit="$1"
-  systemctl is-active --quiet "$unit" || return 1
-  pid=$(systemctl show "$unit" -p MainPID --value 2>/dev/null)
-  { [ -n "$pid" ] && [ "$pid" -gt 0 ] 2>/dev/null; } || return 1
-  rss=$(awk '/^VmRSS:/{print $2}' /proc/"$pid"/status 2>/dev/null)
-  [ -n "$rss" ] || return 1
-  flag="/run/proxyware-memhot.$(systemd-escape "$unit" 2>/dev/null || echo "$unit")"
-  if [ "$rss" -gt "$MEM_LIMIT_KB" ]; then
-    if [ -f "$flag" ]; then                # 직전 비트도 초과 → 자가회수 실패한 고착 → 재시작
-      rm -f "$flag"
-      echo "MEM_RESTART $unit (RSS ${rss}KB > ${MEM_LIMIT_KB}KB, 2 consecutive)"
-      systemctl restart "$unit"
-      return 0
-    fi
-    : > "$flag"                            # 첫 초과 → 1비트 유예(자가회수 기다림)
-    echo "MEM_HOT $unit (RSS ${rss}KB > ${MEM_LIMIT_KB}KB, 1st hit — grace)"
-    return 1
-  fi
-  rm -f "$flag" 2>/dev/null               # 임계 아래로 회수됨 → hot 플래그 해제
-  return 1
-}
-
-# 서비스가 active 된 지 몇 초 지났는지 반환합니다(monotonic 기준이라 시계/타임존 무관).
+# 서비스가 active 된 지 몇 초 지났는지(monotonic 기준 — 시계/타임존 무관).
 active_secs() {
   mono=$(systemctl show "$1" -p ActiveEnterTimestampMonotonic --value 2>/dev/null)
   up=$(awk '{print int($1)}' /proc/uptime)
   echo $(( up - ${mono:-0} / 1000000 ))
 }
 
-# pawns 헬스: 최근 30분의 running / not_running 두 이벤트만 보고 판정합니다(balance_ready는 노이즈라 무시).
-#  - 마지막이 running 이거나, 끊김(not_running)이 아예 없으면 → healthy(터널이 서 있거나 한 번도 안 끊김).
-#    (정상 워커는 not_running이 없으니 항상 healthy → 오탐/flapping 없음.)
-#  - 마지막이 not_running 이면 → 끊김 상태(또는 cant_open_port로 running 미도달). push 보류(→Kuma down)하고,
-#    5분 넘게 그 상태면 재시작합니다.
-# 이 방식은 InvocationID journalctl(부하 큼)을 안 써서 안정적입니다.
-#
-# online 미도달 감지(2026-06-29): pawns의 진짜 online 신호는 running 이벤트다(balance_ready는 잔액조회라
-# online이 아니다 — pawns 대시보드 Active 여부는 running 도달로 갈린다). 두 장애가 여기 걸린다:
-#   (1) 좀비: 크래시 후 재부팅 시 netns IP/경로 준비 전 헛스타트로 멈춰 이벤트가 전무한 상태.
-#   (2) running 미도달: starting/balance_ready까지만 찍고 running에 못 가 대시보드에 안 뜨는 상태.
-# 둘 다 not_running 이벤트가 없어 기존 판정은 healthy로 오판하고 push한다(Kuma 정상 → 대시보드만 진실).
-# 정상 pawns는 재시작 후 ~30초 내 running에 도달하므로, "active 300초+ 인데 부팅 이후 running이 0개"면
-# online 미도달로 본다. 단 online 미도달/좀비는 재시작·재부팅 '직후'에만 발생하므로 age 상한(1800초)을
-# 둔다 — 장수 워커는 초기 running 로그가 journald에서 vacuum돼 사라져(false negative) 멀쩡한데도
-# "running 0개"로 오판되기 때문이다(2026-06-29 이 버그로 home/nest 전 워커를 오재시작한 사고). 30분 넘게
-# 가동된 워커는 이미 안정 online이며, 진짜로 끊기면 not_running 이벤트가 찍혀 아래 로직이 잡는다.
-check_pawns() {
-  unit="$1"; ns="$2"; url="$3"
-  systemctl is-active --quiet "$unit" || return 0
-  age=$(active_secs "$unit")
-  if [ "$age" -ge 300 ] && [ "$age" -le 1800 ] && [ "$(journalctl -u "$unit" -b -o cat 2>/dev/null | grep -c '"name":"running"')" -eq 0 ]; then
-    echo "NO_RUNNING_RESTART $unit (active ${age}s, never reached running)"
-    systemctl restart "$unit"
-    return   # online 미도달 → push 보류(Kuma down)
+# 백오프 단계(초): fail_count -> 다음 재시작까지 대기. 재시작 간격 1,2,5,10,30분, 상한 30분 반복.
+backoff_step() { case "$1" in 0) echo 60 ;; 1) echo 120 ;; 2) echo 300 ;; 3) echo 600 ;; *) echo 1800 ;; esac; }
+
+# ── 벤더별 healthy 판정 ────────────────────────────────────────────────────────
+# pawns: 진짜 online 신호는 running 이벤트다(balance_ready는 잔액조회라 online 아님).
+#   - 최근 30분 마지막이 not_running  → unhealthy(터널 끊김).
+#   - 부팅 이후 running 이력 있음       → healthy.
+#   - running 미도달 & age<300s         → grace(재시작 직후, 도달 대기).
+#   - running 미도달 & 300~1800s        → unhealthy(좀비/미도달).
+#   - running 미도달 & age>1800s        → healthy로 본다. 장수 워커는 초기 running 로그가 journald에서
+#       vacuum돼 false negative가 나기 때문(이 오판으로 전 워커 오재시작한 사고가 있었다). 진짜 끊기면
+#       not_running이 찍혀 위에서 잡힌다.
+pawns_health() {
+  unit="$1"
+  systemctl is-active --quiet "$unit" || { echo skip; return; }
+  last30=$(journalctl -u "$unit" --since "-30min" -o cat 2>/dev/null | grep -oE '"name":"(running|not_running)"' | tail -1)
+  case "$last30" in *not_running*) echo unhealthy; return ;; esac
+  if [ "$(journalctl -u "$unit" -b -o cat 2>/dev/null | grep -c '"name":"running"')" -gt 0 ]; then
+    echo healthy; return
   fi
-  ev=$(journalctl -u "$unit" --since "-30min" -o cat 2>/dev/null | grep -oE '"name":"(running|not_running)"')
-  case "$(printf '%s\n' "$ev" | tail -1)" in
-    *not_running*)
-      [ "$age" -ge 300 ] && systemctl restart "$unit"
-      return ;;   # 끊김이 마지막 → push 보류(Kuma down)
+  age=$(active_secs "$unit")
+  if   [ "$age" -lt 300 ];  then echo grace
+  elif [ "$age" -le 1800 ]; then echo unhealthy
+  else echo healthy
+  fi
+}
+
+# earnfm: active면 healthy(조용함은 정상). 단 RSS가 임계 초과면 unhealthy(힙 폭주 → 재시작 회수).
+#   dart는 spike 후 자가회수하므로, 백오프 첫 단계(60s 유예) 안에 회수되면 healthy로 리셋된다.
+earnfm_health() {
+  unit="$1"
+  systemctl is-active --quiet "$unit" || { echo skip; return; }
+  pid=$(systemctl show "$unit" -p MainPID --value 2>/dev/null)
+  { [ -n "$pid" ] && [ "$pid" -gt 0 ] 2>/dev/null; } || { echo healthy; return; }
+  rss=$(awk '/^VmRSS:/{print $2}' /proc/"$pid"/status 2>/dev/null)
+  { [ -n "$rss" ] && [ "$rss" -gt "$EARNFM_RSS_MAX_KB" ]; } && echo unhealthy || echo healthy
+}
+
+# honeygain: active면 healthy. device_limit 등으로 멈추면 inactive(skip) → push 안 해 Kuma가 down 표시.
+honeygain_health() {
+  unit="$1"
+  systemctl is-active --quiet "$unit" && echo healthy || echo skip
+}
+
+# ── 공통 엔진: 판정 → push/리셋 또는 백오프 재시작 ──────────────────────────────
+handle() {
+  unit="$1"; ns="$2"; url="$3"; health_fn="$4"
+  state="$STATE_DIR/$(systemd-escape "$unit" 2>/dev/null || echo "$unit" | tr '/' '_')"
+  case "$($health_fn "$unit")" in
+    healthy)
+      rm -f "$state"
+      push "$ns" "$url" && echo "OK  $unit" || echo "PUSH_FAIL $unit" ;;
+    grace)
+      echo "GRACE $unit" ;;                       # 재시작·push 보류(도달 대기)
+    unhealthy)
+      now=$(awk '{print int($1)}' /proc/uptime)
+      if [ ! -f "$state" ]; then                  # 첫 unhealthy → 백오프 시작(이번엔 재시작 안 함)
+        echo "0 $now" > "$state"
+        echo "WATCH $unit (1st unhealthy — backoff start)"
+      else
+        count=$(awk '{print $1}' "$state"); last=$(awk '{print $2}' "$state")
+        step=$(backoff_step "${count:-0}")
+        if [ $(( now - ${last:-0} )) -ge "$step" ]; then
+          echo "RESTART $unit (fail #$((count+1)), backoff ${step}s elapsed)"
+          systemctl restart "$unit"
+          echo "$((count+1)) $now" > "$state"
+        else
+          echo "WAIT $unit (backoff ${step}s, $((now-last))s elapsed, fail #$count)"
+        fi
+      fi ;;                                        # unhealthy 동안 push 보류(Kuma down)
+    skip) : ;;                                     # 워치독 관여 안 함(inactive 등 → systemd Restart 영역)
   esac
-  push "$ns" "$url" && echo "OK  $unit" || echo "PUSH_FAIL $unit"
 }
 
-# earnfm: active 면 healthy 입니다(조용함은 정상이고, 죽으면 Restart=always 가 살립니다).
-check_earnfm() {
-  unit="$1"; ns="$2"; url="$3"
-  systemctl is-active --quiet "$unit" && { push "$ns" "$url" && echo "OK  $unit" || echo "PUSH_FAIL $unit"; }
-}
-
-# honeygain: active 면 healthy 입니다. device_limit 등으로 멈추면 inactive 가 되어
-# push 하지 않으므로 Kuma 가 down 으로 표시합니다.
-check_honeygain() {
-  unit="$1"; ns="$2"; url="$3"
-  systemctl is-active --quiet "$unit" && { push "$ns" "$url" && echo "OK  $unit" || echo "PUSH_FAIL $unit"; }
-}
-
-# 워커: /etc/default/pawns-worker<id> 가 있는 모든 id 를 발견해 점검합니다.
+# ── 워커(자동 발견) + 호스트 ────────────────────────────────────────────────────
 for f in /etc/default/pawns-worker*; do
   [ -e "$f" ] || continue
   id="${f##*/pawns-worker}"
-  mem_guard "pawns-worker@$id"  || check_pawns  "pawns-worker@$id"  "w$id" "$(hb_url /etc/default/pawns-worker$id)"
-  mem_guard "earnfm-worker@$id" || check_earnfm "earnfm-worker@$id" "w$id" "$(hb_url /etc/default/earnfm-worker$id)"
-  [ -e /etc/default/honeygain-worker$id ] && { mem_guard "honeygain-worker@$id" || check_honeygain "honeygain-worker@$id" "w$id" "$(hb_url /etc/default/honeygain-worker$id)"; }
+  handle "pawns-worker@$id"  "w$id" "$(hb_url /etc/default/pawns-worker$id)"  pawns_health
+  handle "earnfm-worker@$id" "w$id" "$(hb_url /etc/default/earnfm-worker$id)" earnfm_health
+  [ -e /etc/default/honeygain-worker$id ] && handle "honeygain-worker@$id" "w$id" "$(hb_url /etc/default/honeygain-worker$id)" honeygain_health
 done
-
-# 호스트 자신을 워커로 쓰는 경우(host)도 점검합니다.
-[ -e /etc/default/pawns-host ]  && { mem_guard pawns-host  || check_pawns  pawns-host  host "$(hb_url /etc/default/pawns-host)"; }
-[ -e /etc/default/earnfm-host ] && { mem_guard earnfm-host || check_earnfm earnfm-host host "$(hb_url /etc/default/earnfm-host)"; }
+[ -e /etc/default/pawns-host ]  && handle pawns-host  host "$(hb_url /etc/default/pawns-host)"  pawns_health
+[ -e /etc/default/earnfm-host ] && handle earnfm-host host "$(hb_url /etc/default/earnfm-host)" earnfm_health
