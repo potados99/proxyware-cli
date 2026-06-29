@@ -24,6 +24,29 @@ push() {
 
 hb_url() { sed -n "s/^HEARTBEAT_URL=//p" "$1" 2>/dev/null | tr -d "\""; }
 
+# RSS 가드: proxyware 프로세스가 임계치를 넘으면 재시작해 메모리를 회수합니다.
+# Pi 커널은 cgroup_disable=memory라 systemd MemoryMax가 무효 → MainPID의 VmRSS로 직접 판정합니다.
+# earnfm(dart VM) 힙은 트래픽 처리 후에도 OS에 반환되지 않아 부푸는데(소켓 누수 아님), 재시작이 유일한 회수 수단입니다.
+# 자가치유라 Kuma엔 보고하지 않고(정상 워커는 push 계속), journal에만 한 줄 남깁니다(플래핑 사후 추적용).
+# 반환 0 = 재시작함(이번 사이클 push 스킵), 1 = 정상(이어서 check_* 수행).
+# 임계 128MiB 근거: earnfm 정상 plateau는 60~97MB(home/nest 19h 안정 실측), 비정상 폭주는 150MB+(side 사망 직전).
+# 그 사이 128MiB로 분리 → 정상은 안 건드리고 진짜 폭주만 회수. pawns(7~20MB)/honeygain(36~67MB)은 안 걸림.
+MEM_LIMIT_KB=131072   # 128 MiB
+mem_guard() {
+  unit="$1"
+  systemctl is-active --quiet "$unit" || return 1
+  pid=$(systemctl show "$unit" -p MainPID --value 2>/dev/null)
+  { [ -n "$pid" ] && [ "$pid" -gt 0 ] 2>/dev/null; } || return 1
+  rss=$(awk '/^VmRSS:/{print $2}' /proc/"$pid"/status 2>/dev/null)
+  [ -n "$rss" ] || return 1
+  if [ "$rss" -gt "$MEM_LIMIT_KB" ]; then
+    echo "MEM_RESTART $unit (RSS ${rss}KB > ${MEM_LIMIT_KB}KB)"
+    systemctl restart "$unit"
+    return 0
+  fi
+  return 1
+}
+
 # 서비스가 active 된 지 몇 초 지났는지 반환합니다(monotonic 기준이라 시계/타임존 무관).
 active_secs() {
   mono=$(systemctl show "$1" -p ActiveEnterTimestampMonotonic --value 2>/dev/null)
@@ -66,11 +89,11 @@ check_honeygain() {
 for f in /etc/default/pawns-worker*; do
   [ -e "$f" ] || continue
   id="${f##*/pawns-worker}"
-  check_pawns  "pawns-worker@$id"  "w$id" "$(hb_url /etc/default/pawns-worker$id)"
-  check_earnfm "earnfm-worker@$id" "w$id" "$(hb_url /etc/default/earnfm-worker$id)"
-  [ -e /etc/default/honeygain-worker$id ] && check_honeygain "honeygain-worker@$id" "w$id" "$(hb_url /etc/default/honeygain-worker$id)"
+  mem_guard "pawns-worker@$id"  || check_pawns  "pawns-worker@$id"  "w$id" "$(hb_url /etc/default/pawns-worker$id)"
+  mem_guard "earnfm-worker@$id" || check_earnfm "earnfm-worker@$id" "w$id" "$(hb_url /etc/default/earnfm-worker$id)"
+  [ -e /etc/default/honeygain-worker$id ] && { mem_guard "honeygain-worker@$id" || check_honeygain "honeygain-worker@$id" "w$id" "$(hb_url /etc/default/honeygain-worker$id)"; }
 done
 
 # 호스트 자신을 워커로 쓰는 경우(host)도 점검합니다.
-[ -e /etc/default/pawns-host ]  && check_pawns  pawns-host  host "$(hb_url /etc/default/pawns-host)"
-[ -e /etc/default/earnfm-host ] && check_earnfm earnfm-host host "$(hb_url /etc/default/earnfm-host)"
+[ -e /etc/default/pawns-host ]  && { mem_guard pawns-host  || check_pawns  pawns-host  host "$(hb_url /etc/default/pawns-host)"; }
+[ -e /etc/default/earnfm-host ] && { mem_guard earnfm-host || check_earnfm earnfm-host host "$(hb_url /etc/default/earnfm-host)"; }
