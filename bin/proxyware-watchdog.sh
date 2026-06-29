@@ -24,13 +24,15 @@ push() {
 
 hb_url() { sed -n "s/^HEARTBEAT_URL=//p" "$1" 2>/dev/null | tr -d "\""; }
 
-# RSS 가드: proxyware 프로세스가 임계치를 넘으면 재시작해 메모리를 회수합니다.
+# RSS 가드: proxyware 프로세스가 임계치를 연속 2회(=약 2분) 넘으면 재시작해 메모리를 회수합니다.
 # Pi 커널은 cgroup_disable=memory라 systemd MemoryMax가 무효 → MainPID의 VmRSS로 직접 판정합니다.
-# earnfm(dart VM) 힙은 트래픽 처리 후에도 OS에 반환되지 않아 부푸는데(소켓 누수 아님), 재시작이 유일한 회수 수단입니다.
-# 자가치유라 Kuma엔 보고하지 않고(정상 워커는 push 계속), journal에만 한 줄 남깁니다(플래핑 사후 추적용).
-# 반환 0 = 재시작함(이번 사이클 push 스킵), 1 = 정상(이어서 check_* 수행).
-# 임계 128MiB 근거: earnfm 정상 plateau는 60~97MB(home/nest 19h 안정 실측), 비정상 폭주는 150MB+(side 사망 직전).
-# 그 사이 128MiB로 분리 → 정상은 안 건드리고 진짜 폭주만 회수. pawns(7~20MB)/honeygain(36~67MB)은 안 걸림.
+# earnfm(dart VM) 힙은 트래픽 처리 후 부푸는데(소켓 누수 아님), dart GC가 spike 후 스스로 OS에 반환한다
+# (155MB까지 갔다가 12MB로 자가회수하는 것을 실측). 그래서 단발 측정 즉시 재시작하면 곧 자가회수될
+# spike를 성급히 끊는다 → /run(tmpfs) 플래그로 "직전 비트도 초과"였을 때만 재시작한다(첫 초과는 1비트 유예).
+# 자가회수 실패로 정말 고착된 누수만 회수된다. Kuma엔 보고 안 하고 journal에만 남긴다(사후 추적).
+# 반환 0 = 재시작함(이번 사이클 push 스킵), 1 = 정상/유예(이어서 check_* 수행).
+# 임계 128MiB 근거: earnfm 자연 spike는 ~155MB까지 가나 대부분 90~120MB에서 자가회수. 128MiB+연속2회로
+# 일시 spike는 면제하고 고착만 잡는다. pawns(7~20MB)/honeygain(36~67MB)은 안 걸림.
 MEM_LIMIT_KB=131072   # 128 MiB
 mem_guard() {
   unit="$1"
@@ -39,11 +41,19 @@ mem_guard() {
   { [ -n "$pid" ] && [ "$pid" -gt 0 ] 2>/dev/null; } || return 1
   rss=$(awk '/^VmRSS:/{print $2}' /proc/"$pid"/status 2>/dev/null)
   [ -n "$rss" ] || return 1
+  flag="/run/proxyware-memhot.$(systemd-escape "$unit" 2>/dev/null || echo "$unit")"
   if [ "$rss" -gt "$MEM_LIMIT_KB" ]; then
-    echo "MEM_RESTART $unit (RSS ${rss}KB > ${MEM_LIMIT_KB}KB)"
-    systemctl restart "$unit"
-    return 0
+    if [ -f "$flag" ]; then                # 직전 비트도 초과 → 자가회수 실패한 고착 → 재시작
+      rm -f "$flag"
+      echo "MEM_RESTART $unit (RSS ${rss}KB > ${MEM_LIMIT_KB}KB, 2 consecutive)"
+      systemctl restart "$unit"
+      return 0
+    fi
+    : > "$flag"                            # 첫 초과 → 1비트 유예(자가회수 기다림)
+    echo "MEM_HOT $unit (RSS ${rss}KB > ${MEM_LIMIT_KB}KB, 1st hit — grace)"
+    return 1
   fi
+  rm -f "$flag" 2>/dev/null               # 임계 아래로 회수됨 → hot 플래그 해제
   return 1
 }
 
@@ -67,12 +77,15 @@ active_secs() {
 #   (2) running 미도달: starting/balance_ready까지만 찍고 running에 못 가 대시보드에 안 뜨는 상태.
 # 둘 다 not_running 이벤트가 없어 기존 판정은 healthy로 오판하고 push한다(Kuma 정상 → 대시보드만 진실).
 # 정상 pawns는 재시작 후 ~30초 내 running에 도달하므로, "active 300초+ 인데 부팅 이후 running이 0개"면
-# online 미도달로 확정해 재시작한다(running 도달 시간을 넉넉히 기다려 오탐 없음).
+# online 미도달로 본다. 단 online 미도달/좀비는 재시작·재부팅 '직후'에만 발생하므로 age 상한(1800초)을
+# 둔다 — 장수 워커는 초기 running 로그가 journald에서 vacuum돼 사라져(false negative) 멀쩡한데도
+# "running 0개"로 오판되기 때문이다(2026-06-29 이 버그로 home/nest 전 워커를 오재시작한 사고). 30분 넘게
+# 가동된 워커는 이미 안정 online이며, 진짜로 끊기면 not_running 이벤트가 찍혀 아래 로직이 잡는다.
 check_pawns() {
   unit="$1"; ns="$2"; url="$3"
   systemctl is-active --quiet "$unit" || return 0
   age=$(active_secs "$unit")
-  if [ "$age" -ge 300 ] && [ "$(journalctl -u "$unit" -b -o cat 2>/dev/null | grep -c '"name":"running"')" -eq 0 ]; then
+  if [ "$age" -ge 300 ] && [ "$age" -le 1800 ] && [ "$(journalctl -u "$unit" -b -o cat 2>/dev/null | grep -c '"name":"running"')" -eq 0 ]; then
     echo "NO_RUNNING_RESTART $unit (active ${age}s, never reached running)"
     systemctl restart "$unit"
     return   # online 미도달 → push 보류(Kuma down)
