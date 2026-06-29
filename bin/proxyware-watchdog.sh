@@ -60,13 +60,25 @@ active_secs() {
 #  - 마지막이 not_running 이면 → 끊김 상태(또는 cant_open_port로 running 미도달). push 보류(→Kuma down)하고,
 #    5분 넘게 그 상태면 재시작합니다.
 # 이 방식은 InvocationID journalctl(부하 큼)을 안 써서 안정적입니다.
+#
+# 좀비 감지(2026-06-29 추가): 크래시 후 재부팅 시 pawns가 netns IP/경로 준비 전 헛스타트로 멈춰,
+# systemd상 active(running)이지만 실제론 로그도 트래픽도 없는 좀비가 된다. 이때 not_running 이벤트조차
+# 없어서 위 판정은 healthy로 오판하고 heartbeat를 push한다(Kuma도 정상으로 보임 → pawns 대시보드만 진실).
+# 정상 pawns는 시작 직후 반드시 starting/balance_ready를 찍으므로, "active 180초+ 인데 부팅 이후 이벤트가
+# 0개"면 좀비로 확정해 재시작한다(오탐 없음).
 check_pawns() {
   unit="$1"; ns="$2"; url="$3"
   systemctl is-active --quiet "$unit" || return 0
+  age=$(active_secs "$unit")
+  if [ "$age" -ge 180 ] && [ "$(journalctl -u "$unit" -b -o cat 2>/dev/null | grep -c '"name":')" -eq 0 ]; then
+    echo "ZOMBIE_RESTART $unit (active ${age}s, zero events since boot)"
+    systemctl restart "$unit"
+    return   # 좀비 → push 보류(Kuma down)
+  fi
   ev=$(journalctl -u "$unit" --since "-30min" -o cat 2>/dev/null | grep -oE '"name":"(running|not_running)"')
   case "$(printf '%s\n' "$ev" | tail -1)" in
     *not_running*)
-      [ "$(active_secs "$unit")" -ge 300 ] && systemctl restart "$unit"
+      [ "$age" -ge 300 ] && systemctl restart "$unit"
       return ;;   # 끊김이 마지막 → push 보류(Kuma down)
   esac
   push "$ns" "$url" && echo "OK  $unit" || echo "PUSH_FAIL $unit"
