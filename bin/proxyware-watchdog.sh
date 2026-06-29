@@ -61,19 +61,21 @@ active_secs() {
 #    5분 넘게 그 상태면 재시작합니다.
 # 이 방식은 InvocationID journalctl(부하 큼)을 안 써서 안정적입니다.
 #
-# 좀비 감지(2026-06-29 추가): 크래시 후 재부팅 시 pawns가 netns IP/경로 준비 전 헛스타트로 멈춰,
-# systemd상 active(running)이지만 실제론 로그도 트래픽도 없는 좀비가 된다. 이때 not_running 이벤트조차
-# 없어서 위 판정은 healthy로 오판하고 heartbeat를 push한다(Kuma도 정상으로 보임 → pawns 대시보드만 진실).
-# 정상 pawns는 시작 직후 반드시 starting/balance_ready를 찍으므로, "active 180초+ 인데 부팅 이후 이벤트가
-# 0개"면 좀비로 확정해 재시작한다(오탐 없음).
+# online 미도달 감지(2026-06-29): pawns의 진짜 online 신호는 running 이벤트다(balance_ready는 잔액조회라
+# online이 아니다 — pawns 대시보드 Active 여부는 running 도달로 갈린다). 두 장애가 여기 걸린다:
+#   (1) 좀비: 크래시 후 재부팅 시 netns IP/경로 준비 전 헛스타트로 멈춰 이벤트가 전무한 상태.
+#   (2) running 미도달: starting/balance_ready까지만 찍고 running에 못 가 대시보드에 안 뜨는 상태.
+# 둘 다 not_running 이벤트가 없어 기존 판정은 healthy로 오판하고 push한다(Kuma 정상 → 대시보드만 진실).
+# 정상 pawns는 재시작 후 ~30초 내 running에 도달하므로, "active 300초+ 인데 부팅 이후 running이 0개"면
+# online 미도달로 확정해 재시작한다(running 도달 시간을 넉넉히 기다려 오탐 없음).
 check_pawns() {
   unit="$1"; ns="$2"; url="$3"
   systemctl is-active --quiet "$unit" || return 0
   age=$(active_secs "$unit")
-  if [ "$age" -ge 180 ] && [ "$(journalctl -u "$unit" -b -o cat 2>/dev/null | grep -c '"name":')" -eq 0 ]; then
-    echo "ZOMBIE_RESTART $unit (active ${age}s, zero events since boot)"
+  if [ "$age" -ge 300 ] && [ "$(journalctl -u "$unit" -b -o cat 2>/dev/null | grep -c '"name":"running"')" -eq 0 ]; then
+    echo "NO_RUNNING_RESTART $unit (active ${age}s, never reached running)"
     systemctl restart "$unit"
-    return   # 좀비 → push 보류(Kuma down)
+    return   # online 미도달 → push 보류(Kuma down)
   fi
   ev=$(journalctl -u "$unit" --since "-30min" -o cat 2>/dev/null | grep -oE '"name":"(running|not_running)"')
   case "$(printf '%s\n' "$ev" | tail -1)" in
