@@ -81,7 +81,12 @@ pawns_health() {
 earnfm_health() {
   unit="$1"
   systemctl is-active --quiet "$unit" || { echo skip; return; }
-  if journalctl -u "$unit" -n 20 -o cat 2>/dev/null | grep -q "user is limited"; then
+  # limited 좀비: 반드시 "이번 세션(재시작 이후)" 로그만 본다. 옛 limited 로그가 저널에 남아 재시작 직후
+  # 즉사시키는 버그를 막기 위해 --since를 active된 시점 이후로 한정하고, 재시작 후 30초는 연결 시도 시간을
+  # 줘 판정을 보류(grace). 창은 부하 방지로 최대 1시간. (2026-07-02 즉사 버그 수정)
+  age=$(active_secs "$unit")
+  win=$([ "$age" -lt 3600 ] && echo "$age" || echo 3600)
+  if [ "$age" -ge 30 ] && journalctl -u "$unit" --since "-${win}s" -o cat 2>/dev/null | grep -q "user is limited"; then
     echo zombie; return
   fi
   pid=$(systemctl show "$unit" -p MainPID --value 2>/dev/null)
