@@ -15,7 +15,10 @@ set -u
 STATE_DIR=/run/proxyware-wd
 mkdir -p "$STATE_DIR" 2>/dev/null
 
-EARNFM_RSS_MAX_KB=131072   # 128 MiB. earnfm(dart) 힙 폭주 회수 기준(정상 plateau 60~120MB, 폭주 150MB+).
+EARNFM_RSS_MAX_KB=204800   # 200 MiB. earnfm(dart) 힙 폭주 회수 기준. 실측 plateau 60~155MB라 128은 아침
+                           # 피크에 정상 워커를 자주 침 → 재시작 유발 → earnfm이 재시작마다 harvester(deviceName)를
+                           # 재생성해 유령 기기 양산 + 잦은 재등록 rate limit(user is limited) 위험. 200으로 올려
+                           # 재시작을 최소화한다. SidePi(1GB) OOM은 디스크 스왑 2GB가 완충(2026-07-02).
 
 # push <ns|host> <url>: netns(또는 호스트)에서 heartbeat GET. 성공 시 0. 간헐 실패 대비 2회 재시도.
 push() {
