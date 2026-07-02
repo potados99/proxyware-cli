@@ -73,11 +73,17 @@ pawns_health() {
   fi
 }
 
-# earnfm: active면 healthy(조용함은 정상). 단 RSS가 임계 초과면 unhealthy(힙 폭주 → 재시작 회수).
-#   dart는 spike 후 자가회수하므로, 백오프 첫 단계(60s 유예) 안에 회수되면 healthy로 리셋된다.
+# earnfm: active면 healthy(조용함은 정상). 두 예외:
+#   1) limited 좀비 — active인데 earnfm 서버가 "user is limited"로 거부(트래픽 0인데 systemd는 active).
+#      이걸 healthy로 오판하면 Kuma에 online으로 뜨나 실제론 죽음(업타임-실측 불일치). 재시작은 무의미
+#      (서버측 판단 + 재시작마다 새 harvester 양산으로 악화)하므로 → zombie 판정 → handle이 stop시킨다.
+#   2) RSS 임계 초과 → unhealthy(백오프 재시작). dart는 spike 후 자가회수하므로 60s 유예로 흡수.
 earnfm_health() {
   unit="$1"
   systemctl is-active --quiet "$unit" || { echo skip; return; }
+  if journalctl -u "$unit" -n 20 -o cat 2>/dev/null | grep -q "user is limited"; then
+    echo zombie; return
+  fi
   pid=$(systemctl show "$unit" -p MainPID --value 2>/dev/null)
   { [ -n "$pid" ] && [ "$pid" -gt 0 ] 2>/dev/null; } || { echo healthy; return; }
   rss=$(awk '/^VmRSS:/{print $2}' /proc/"$pid"/status 2>/dev/null)
@@ -116,6 +122,10 @@ handle() {
           echo "WAIT $unit (backoff ${step}s, $((now-last))s elapsed, fail #$count)"
         fi
       fi ;;                                        # unhealthy 동안 push 보류(Kuma down)
+    zombie)
+      rm -f "$state"
+      systemctl stop "$unit"                       # earnfm limited: 재시작 무의미 → 정지(사람 개입 대기)
+      echo "ZOMBIE_STOP $unit (user is limited)" ;;  # push 보류 → Kuma down으로 실측과 일치시킴
     skip) : ;;                                     # 워치독 관여 안 함(inactive 등 → systemd Restart 영역)
   esac
 }
