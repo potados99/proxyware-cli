@@ -3,4 +3,9 @@ Description=proxyware 통합 워치독 (헬스체크 + Kuma heartbeat)
 
 [Service]
 Type=oneshot
+# hang 방어: 한 사이클이 어딘가에서 멈춰도 45초에 강제 종료해 timer가 다음 사이클을 정상 발화하게 한다.
+# (2026-07-05 사고: TimeoutStartSec 무제한이라 한 사이클 hang이 워치독 3시간 50분 정지로 번져 Kuma가
+#  전 워커를 down 오판 → 알림 폭탄. 45초는 정상 사이클(수초)보다 넉넉하고 timer 주기(60초)보다 짧다.
+#  1사이클 놓쳐도 Kuma retry 2회가 흡수한다.)
+TimeoutStartSec=45
 ExecStart=/usr/local/bin/proxyware-watchdog.sh

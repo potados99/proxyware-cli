@@ -49,24 +49,47 @@ active_secs() {
 # 백오프 단계(초): fail_count -> 다음 재시작까지 대기. 재시작 간격 1,2,5,10,30분, 상한 30분 반복.
 backoff_step() { case "$1" in 0) echo 60 ;; 1) echo 120 ;; 2) echo 300 ;; 3) echo 600 ;; *) echo 1800 ;; esac; }
 
+# pawns가 실제로 릴레이 서버와 맺고 있는 established TCP 연결 수(해당 pid만).
+# 워커는 netns 안에서 센다(같은 netns의 earnfm 연결과 섞이지 않게 pid로 필터). host는 그냥 호스트에서.
+# systemd active·running 이력이 있어도 이 수가 바닥이면 릴레이를 못 받는 좀비다(side01: 2개로 7시간 방치).
+pawns_established() {
+  unit="$1"; pid="$2"
+  case "$unit" in
+    *-worker@*) pre="ip netns exec w${unit##*@}" ;;
+    *)          pre="" ;;
+  esac
+  $pre ss -Htnp state established 2>/dev/null | grep -c "pid=$pid,"
+}
+
 # ── 벤더별 healthy 판정 ────────────────────────────────────────────────────────
 # pawns: 진짜 online 신호는 running 이벤트다(balance_ready는 잔액조회라 online 아님).
-#   - 최근 30분 마지막이 not_running  → unhealthy(터널 끊김).
-#   - 부팅 이후 running 이력 있음       → healthy.
-#   - running 미도달 & age<300s         → grace(재시작 직후, 도달 대기).
-#   - running 미도달 & 300~1800s        → unhealthy(좀비/미도달).
-#   - running 미도달 & age>1800s        → healthy로 본다. 장수 워커는 초기 running 로그가 journald에서
+#   - 최근 30분 마지막이 not_running       → unhealthy(터널 끊김).
+#   - age>600s인데 established ≤2          → unhealthy(좀비). running 이력이 있어도 실제 릴레이 연결이
+#       바닥이면 systemd는 active·Kuma는 up이지만 실질 죽음이다(side01: est 2로 7시간 방치, running 로그만
+#       믿던 기존 판정이 이걸 못 잡았다). 재시작 직후 연결이 쌓일 시간을 주려 age>600s에서만 본다.
+#   - 부팅 이후 running 이력 있음           → healthy.
+#   - running 미도달 & age<300s            → grace(재시작 직후, 도달 대기).
+#   - running 미도달 & 300~1800s           → unhealthy(좀비/미도달).
+#   - running 미도달 & age>1800s           → healthy로 본다. 장수 워커는 초기 running 로그가 journald에서
 #       vacuum돼 false negative가 나기 때문(이 오판으로 전 워커 오재시작한 사고가 있었다). 진짜 끊기면
-#       not_running이 찍혀 위에서 잡힌다.
+#       not_running 또는 established 바닥으로 위에서 잡힌다.
 pawns_health() {
   unit="$1"
   systemctl is-active --quiet "$unit" || { echo skip; return; }
   last30=$(journalctl -u "$unit" --since "-30min" -o cat 2>/dev/null | grep -oE '"name":"(running|not_running)"' | tail -1)
   case "$last30" in *not_running*) echo unhealthy; return ;; esac
+  age=$(active_secs "$unit")
+  # 좀비 검출: running 이력이 있어도 릴레이 established가 바닥이면 실질 죽음 → 재시작.
+  if [ "$age" -gt 600 ]; then
+    pid=$(systemctl show "$unit" -p MainPID --value 2>/dev/null)
+    if [ -n "$pid" ] && [ "$pid" -gt 0 ] 2>/dev/null; then
+      est=$(pawns_established "$unit" "$pid")
+      [ "${est:-0}" -le 2 ] 2>/dev/null && { echo unhealthy; return; }
+    fi
+  fi
   if [ "$(journalctl -u "$unit" -b -o cat 2>/dev/null | grep -c '"name":"running"')" -gt 0 ]; then
     echo healthy; return
   fi
-  age=$(active_secs "$unit")
   if   [ "$age" -lt 300 ];  then echo grace
   elif [ "$age" -le 1800 ]; then echo unhealthy
   else echo healthy

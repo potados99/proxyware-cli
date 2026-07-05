@@ -1,5 +1,5 @@
 [Unit]
-Description=proxyware 워치독 5분 주기
+Description=proxyware 워치독 1분 주기
 
 [Timer]
 OnBootSec=1min
