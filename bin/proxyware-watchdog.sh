@@ -147,3 +147,29 @@ for f in /etc/default/pawns-worker*; do
 done
 [ -e /etc/default/pawns-host ]  && handle pawns-host  host "$(hb_url /etc/default/pawns-host)"  pawns_health
 [ -e /etc/default/earnfm-host ] && handle earnfm-host host "$(hb_url /etc/default/earnfm-host)" earnfm_health
+
+# ── earnfm 컨트롤 재연결 급증 = 밴 조기경보 ──────────────────────────────────────
+# earnfm이 유럽 컨트롤 서버(websocket)를 반복 재연결하면(그 IP↔서버 국제경로 불안정), 수시간 뒤
+# 'user is limited'로 밴당한다(실측: home04 재연결 63회·home06 47회 → 밴 / 정상 워커 0~1회). 재연결이
+# 밴보다 선행하므로 조기경보로 쓴다. earnfm 자체 로그만 세어(서버에 아무 연결도 안 만듦) 무해하다 —
+# 능동 TCP 폴링은 그 IP에서 연결을 자꾸 열어 서버가 불안정으로 오인, 오히려 밴을 유발할 수 있어 금지.
+# 경보 채널: /etc/default/earnfm-reconn-alert 의 HEARTBEAT_URL(Kuma push). 급증 워커가 있으면 push를
+# 보류해 Kuma가 down→알림. 없으면 push(up). URL 미설정이면 journal 로그로만 남긴다(Kuma 모니터 준비 전).
+RECONN_THRESHOLD=5   # 최근 1h Reconnecting 횟수 임계. 정상 0~1, 밴 직전 수십.
+reconn_alert=""
+for f in /etc/default/earnfm-worker*; do
+  [ -e "$f" ] || continue
+  eid="${f##*/earnfm-worker}"
+  eunit="earnfm-worker@$eid"
+  systemctl is-active --quiet "$eunit" || continue
+  rn=$(journalctl -u "$eunit" --since "-1h" -o cat 2>/dev/null | grep -c 'Reconnecting')
+  [ "${rn:-0}" -ge "$RECONN_THRESHOLD" ] && reconn_alert="$reconn_alert $eunit=$rn"
+done
+alert_url="$(hb_url /etc/default/earnfm-reconn-alert)"
+if [ -n "$reconn_alert" ]; then
+  logger -t proxyware-watchdog "RECONN_ALERT 밴 조기경보(재연결 급증):$reconn_alert"
+  echo "RECONN_ALERT$reconn_alert"          # push 보류 → Kuma down → 알림(URL 설정 시)
+else
+  [ -n "$alert_url" ] && push host "$alert_url"
+  echo "RECONN_OK"
+fi
