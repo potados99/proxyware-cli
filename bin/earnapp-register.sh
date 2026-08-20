@@ -51,6 +51,8 @@ else
     for f in /etc/proxyware/earnapp/w*/uuid; do
         [ -e "$f" ] || continue
         d="${f%/uuid}"; b="${d##*/w}"
+        # 숫자 ID만 받는다. 백업 디렉토리(w01.bak-1138 등)가 기기로 잡히는 걸 막는다.
+        case "$b" in ''|*[!0-9]*) continue ;; esac
         targets+=("$b")
     done
     [ -f /etc/earnapp/uuid ] && targets+=("host")
