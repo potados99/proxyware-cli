@@ -1,0 +1,20 @@
+[Unit]
+Description=earnapp host
+Wants=network-online.target
+After=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Slice=proxyware.slice
+IPAccounting=yes
+Environment=HOME=/tmp
+# 워커 유닛과 같은 이유로 필수. 없으면 기기 등록 실패.
+Environment=NODE_EXTRA_CA_CERTS=/etc/ssl/certs/ca-certificates.crt
+ExecStart=/usr/local/bin/earnapp run
+Restart=always
+RestartSec=30
+NoNewPrivileges=yes
+# 호스트는 netns 없이 기본 네트워크로 나가므로 /etc/earnapp를 그대로 쓴다(바인드마운트 불필요).
+
+[Install]
+WantedBy=multi-user.target

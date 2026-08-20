@@ -1,0 +1,12 @@
+[Unit]
+Description=earnapp FD 누수 감시 1분 주기
+Requires=earnapp-fd-monitor.service
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=1min
+AccuracySec=10s
+RandomizedDelaySec=10
+
+[Install]
+WantedBy=timers.target

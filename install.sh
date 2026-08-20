@@ -13,7 +13,12 @@
 #     --pawns-email a@b.c --pawns-pass pw --device-id side-worker01 \
 #     --earnfm-token <TOKEN> \
 #     --kuma-url https://status.example.com --kuma-user u --kuma-pass p
-#   (Kuma 대신 직접 줄 수도: --pawns-hb <URL> --earnfm-hb <URL>)
+#     --earnapp \
+#     --kuma-url https://status.example.com --kuma-user u --kuma-pass p
+#   (Kuma 대신 직접 줄 수도: --pawns-hb <URL> --earnfm-hb <URL> --earnapp-hb <URL>)
+#
+# earnapp은 계정 자격증명이 필요 없습니다(기기 식별자가 uuid 파일 하나). --earnapp만 주면
+# 설치되고, 설치 후 sudo earnapp-register.sh 로 등록하고 계정 연결 링크를 받으세요.
 set -euo pipefail
 
 REPO="potados99/proxyware-cli"
@@ -66,13 +71,19 @@ ensure_base() {  # ensure_base <parent-nic>
     put net/proxyns-down      "$SBIN/proxyns-down"          755
     put net/udhcpc.script     "$PROX_DIR/udhcpc.script"     755
     put net/resolv.conf       "$PROX_DIR/resolv.conf"       644
-    for u in worker-net@ worker-dhcp@ pawns-worker@ earnfm-worker@ honeygain-worker@; do
+    for u in worker-net@ worker-dhcp@ pawns-worker@ earnfm-worker@ honeygain-worker@ earnapp-worker@; do
         put "systemd/$u.service" "$UNIT/$u.service"
     done
     put systemd/proxyware.slice              "$UNIT/proxyware.slice"
     put systemd/proxyware-watchdog.service   "$UNIT/proxyware-watchdog.service"
     put systemd/proxyware-watchdog.timer     "$UNIT/proxyware-watchdog.timer"
     put bin/proxyware-watchdog.sh            "$BIN/proxyware-watchdog.sh"  755
+
+    # earnapp FD 누수 감시 (earnapp을 안 쓰는 호스트에서도 유닛만 깔려 있고 유휴다)
+    put bin/earnapp-fd-monitor.sh            "$BIN/earnapp-fd-monitor.sh"   755
+    put bin/earnapp-register.sh              "$BIN/earnapp-register.sh"     755
+    put systemd/earnapp-fd-monitor.service   "$UNIT/earnapp-fd-monitor.service"
+    put systemd/earnapp-fd-monitor.timer     "$UNIT/earnapp-fd-monitor.timer"
 
     # 부모 NIC을 NetworkManager에서 영구 unmanaged로 (macvlan 부모로 쓰기 위해).
     if [ -d /etc/NetworkManager ]; then
@@ -91,6 +102,26 @@ kuma_hb() {  # kuma_hb <monitor-name>
         --password "$KUMA_PASS" --name "$1" 2>/dev/null || echo ""
 }
 
+# earnapp 기기 디렉토리를 준비합니다.
+# ⚠️ consent/status/ver 세 파일이 없으면 `earnapp run`이 exit 1로 즉사해 무한 재시작만 돕니다
+#    (uuid는 스스로 만들지만 consent가 없으면 시작 자체를 거부한다 — 2026-08-20 실측).
+# ver은 바이너리에서 읽어 어긋나지 않게 합니다. uuid는 첫 기동 때 자동 생성됩니다.
+earnapp_seed() {  # earnapp_seed <dir>
+    local d="$1" ver
+    ver="$("$BIN/earnapp" --version 2>/dev/null | awk '{print $NF}')"
+    mkdir -p "$d"
+    [ -f "$d/consent" ] || printf '1:%s\n' "$(date +%s%3N)" > "$d/consent"
+    [ -f "$d/status" ]  || echo enabled > "$d/status"
+    printf '%s\n' "${ver:-unknown}" > "$d/ver"
+}
+
+# 벤더 자동 업그레이더는 끕니다. 버전 관리 주체는 proxyware-cli이고,
+# 업그레이더 자체가 1대당 약 59MB를 더 씁니다. (공식 install.sh를 돌린 흔적이 있으면 존재)
+earnapp_mask_vendor() {
+    systemctl disable --now earnapp.service earnapp_upgrader.service >/dev/null 2>&1 || true
+    systemctl mask earnapp.service earnapp_upgrader.service >/dev/null 2>&1 || true
+}
+
 # ---- 인자 파싱 ----
 [ $# -ge 1 ] || { echo "사용법: install.sh <worker|host> [옵션...]" >&2; exit 1; }
 CMD="$1"; shift
@@ -98,6 +129,7 @@ ID=""; MAC=""; PARENT="eth0"
 P_EMAIL=""; P_PASS=""; P_DEVID=""; P_DEVNAME=""; E_TOKEN=""
 P_HB=""; E_HB=""; KUMA_URL=""; KUMA_USER=""; KUMA_PASS=""
 HG_EMAIL=""; HG_PASS=""; HG_DEV=""; HG_HB=""
+EARNAPP=0; EA_HB=""
 while [ $# -gt 0 ]; do case "$1" in
     --id)              ID="$2"; shift 2 ;;
     --mac)             MAC="$2"; shift 2 ;;
@@ -113,6 +145,8 @@ while [ $# -gt 0 ]; do case "$1" in
     --pawns-hb)        P_HB="$2"; shift 2 ;;
     --earnfm-hb)       E_HB="$2"; shift 2 ;;
     --honeygain-hb)    HG_HB="$2"; shift 2 ;;
+    --earnapp)         EARNAPP=1; shift ;;
+    --earnapp-hb)      EA_HB="$2"; EARNAPP=1; shift 2 ;;
     --kuma-url)        KUMA_URL="$2"; shift 2 ;;
     --kuma-user)       KUMA_USER="$2"; shift 2 ;;
     --kuma-pass)       KUMA_PASS="$2"; shift 2 ;;
@@ -156,10 +190,25 @@ PASSWORD=$HG_PASS
 DEVICE_NAME=$HG_DEV
 HEARTBEAT_URL=$HG_HB"
         systemctl enable --now "honeygain-worker@$ID"
-        echo "완료: worker$ID — pawns + earnfm + honeygain"
+        APPS="pawns + earnfm + honeygain"
     else
-        echo "완료: worker$ID — pawns + earnfm"
+        APPS="pawns + earnfm"
     fi
+
+    # earnapp (선택): --earnapp 을 주면 같은 IP에 함께 띄웁니다. 자격증명 불필요.
+    if [ "$EARNAPP" -eq 1 ]; then
+        ensure_runtime earnapp
+        earnapp_mask_vendor
+        earnapp_seed "$PROX_DIR/earnapp/w$ID"
+        [ -n "$EA_HB" ] || EA_HB="$(kuma_hb "${P_DEVID:-worker$ID} earnapp")"
+        write_env "/etc/default/earnapp-worker$ID" "HEARTBEAT_URL=$EA_HB"
+        systemctl enable --now "earnapp-worker@$ID"
+        systemctl enable --now earnapp-fd-monitor.timer
+        APPS="$APPS + earnapp"
+    fi
+
+    echo "완료: worker$ID — $APPS"
+    [ "$EARNAPP" -eq 1 ] && echo "  → earnapp 기기 등록: sudo $BIN/earnapp-register.sh $ID"
     ;;
 host)
     # 호스트 자신을 워커로 (netns 없이 호스트 기본 네트워크로 나감).
@@ -177,7 +226,21 @@ HEARTBEAT_URL=$E_HB"
     put systemd/earnfm-host.service "$UNIT/earnfm-host.service"
     systemctl daemon-reload
     systemctl enable --now pawns-host.service earnfm-host.service
-    echo "완료: host — systemctl status pawns-host earnfm-host"
+
+    if [ "$EARNAPP" -eq 1 ]; then
+        ensure_runtime earnapp
+        earnapp_mask_vendor
+        earnapp_seed /etc/earnapp
+        [ -n "$EA_HB" ] || EA_HB="$(kuma_hb "${P_DEVID:-$(hostname)} earnapp")"
+        write_env "/etc/default/earnapp-host" "HEARTBEAT_URL=$EA_HB"
+        put systemd/earnapp-host.service "$UNIT/earnapp-host.service"
+        systemctl daemon-reload
+        systemctl enable --now earnapp-host.service earnapp-fd-monitor.timer
+        echo "완료: host — pawns + earnfm + earnapp"
+        echo "  → earnapp 기기 등록: sudo $BIN/earnapp-register.sh host"
+    else
+        echo "완료: host — systemctl status pawns-host earnfm-host"
+    fi
     ;;
 *) echo "모르는 서브커맨드: $CMD (worker|host)" >&2; exit 1 ;;
 esac

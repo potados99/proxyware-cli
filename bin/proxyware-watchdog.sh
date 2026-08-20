@@ -103,6 +103,14 @@ honeygain_health() {
   systemctl is-active --quiet "$unit" && echo healthy || echo skip
 }
 
+# earnapp: active면 healthy. FD 누수는 earnapp-fd-monitor.timer가 별도로 잡는다(kill → systemd 재기동).
+# 크래시루프(activating)·정지 상태는 skip → push 안 해 Kuma가 down으로 실측과 일치.
+# (재시작을 우리가 하지 않는 이유: earnapp 유닛 자체가 Restart=always다. 워치독이 겹쳐 흔들 필요 없다.)
+earnapp_health() {
+  unit="$1"
+  systemctl is-active --quiet "$unit" && echo healthy || echo skip
+}
+
 # ── 공통 엔진: 판정 → push/리셋 또는 백오프 재시작 ──────────────────────────────
 handle() {
   unit="$1"; ns="$2"; url="$3"; health_fn="$4"
@@ -144,9 +152,11 @@ for f in /etc/default/pawns-worker*; do
   handle "pawns-worker@$id"  "w$id" "$(hb_url /etc/default/pawns-worker$id)"  pawns_health
   handle "earnfm-worker@$id" "w$id" "$(hb_url /etc/default/earnfm-worker$id)" earnfm_health
   [ -e /etc/default/honeygain-worker$id ] && handle "honeygain-worker@$id" "w$id" "$(hb_url /etc/default/honeygain-worker$id)" honeygain_health
+  [ -e /etc/default/earnapp-worker$id ] && handle "earnapp-worker@$id" "w$id" "$(hb_url /etc/default/earnapp-worker$id)" earnapp_health
 done
 [ -e /etc/default/pawns-host ]  && handle pawns-host  host "$(hb_url /etc/default/pawns-host)"  pawns_health
 [ -e /etc/default/earnfm-host ] && handle earnfm-host host "$(hb_url /etc/default/earnfm-host)" earnfm_health
+[ -e /etc/default/earnapp-host ] && handle earnapp-host host "$(hb_url /etc/default/earnapp-host)" earnapp_health
 
 # ── earnfm 컨트롤 재연결 급증 = 밴 조기경보 ──────────────────────────────────────
 # earnfm이 유럽 컨트롤 서버(websocket)를 반복 재연결하면(그 IP↔서버 국제경로 불안정), 수시간 뒤
@@ -172,4 +182,34 @@ if [ -n "$reconn_alert" ]; then
 else
   [ -n "$alert_url" ] && push host "$alert_url"
   echo "RECONN_OK"
+fi
+
+# ── earnapp IP 터널 실패 경보 ───────────────────────────────────────────────────
+# earnapp은 "특정 IP만 터널 협상을 못 끝내는" 실패가 있다(2026-08-20 nest w01: 재시작 264회,
+# 수익 0). 증상은 무한 크래시루프이고, 판별 지표는 두 개다:
+#   ① 상태 디렉토리에 perr_tun_init_err 가 상주 (성공하면 tun_start/tun_1b/udp_..._success가 뜬다)
+#   ② NRestarts 급증
+# 원인은 그 IP의 경로이므로 재시작·uuid 재발급으로는 안 낫는다 → MAC 교체(IP 교체)가 처방이다.
+# 사람이 판단할 일이라 자동 조치는 하지 않고 경보만 띄운다.
+# 채널: /etc/default/earnapp-tunnel-alert 의 HEARTBEAT_URL (없으면 로그만 남는다)
+EARNAPP_RESTART_THRESHOLD="${EARNAPP_RESTART_THRESHOLD:-20}"
+ea_alert=""
+for f in /etc/default/earnapp-worker*; do
+  [ -e "$f" ] || continue
+  eid="${f##*/earnapp-worker}"; eunit="earnapp-worker@$eid"
+  dir="/etc/proxyware/earnapp/w$eid"
+  err=0
+  [ -e "$dir" ] && ls "$dir" 2>/dev/null | grep -q 'perr_tun_init_err' && err=1
+  nr=$(systemctl show "$eunit" -p NRestarts --value 2>/dev/null)
+  if [ "$err" -eq 1 ] || [ "${nr:-0}" -ge "$EARNAPP_RESTART_THRESHOLD" ]; then
+    ea_alert="$ea_alert $eunit(restarts=${nr:-0},tun_err=$err)"
+  fi
+done
+ea_url="$(hb_url /etc/default/earnapp-tunnel-alert)"
+if [ -n "$ea_alert" ]; then
+  logger -t proxyware-watchdog "EARNAPP_TUNNEL_ALERT IP 터널 실패 의심(MAC 교체 검토):$ea_alert"
+  echo "EARNAPP_TUNNEL_ALERT$ea_alert"     # push 보류 → Kuma down → 알림
+else
+  [ -n "$ea_url" ] && push host "$ea_url"
+  echo "EARNAPP_TUNNEL_OK"
 fi

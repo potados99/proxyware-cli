@@ -1,0 +1,12 @@
+[Unit]
+Description=earnapp FD 누수 감시 (임계 초과 프로세스 kill)
+Documentation=https://github.com/potados99/earnapp-fd-monitor
+
+[Service]
+Type=oneshot
+# hang 방어: 한 사이클이 멈춰도 30초에 끊어 timer가 다음 사이클을 정상 발화하게 한다.
+TimeoutStartSec=30
+ExecStart=/usr/local/bin/earnapp-fd-monitor.sh
+User=root
+NoNewPrivileges=true
+PrivateTmp=true
