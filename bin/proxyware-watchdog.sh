@@ -103,12 +103,66 @@ honeygain_health() {
   systemctl is-active --quiet "$unit" && echo healthy || echo skip
 }
 
-# earnapp: active면 healthy. FD 누수는 earnapp-fd-monitor.timer가 별도로 잡는다(kill → systemd 재기동).
-# 크래시루프(activating)·정지 상태는 skip → push 안 해 Kuma가 down으로 실측과 일치.
-# (재시작을 우리가 하지 않는 이유: earnapp 유닛 자체가 Restart=always다. 워치독이 겹쳐 흔들 필요 없다.)
+# earnapp: active면서 "실제로 트래픽이 흐르는가"까지 본다.
+# ⚠️ systemd active ≠ 동작. 2026-09-05 nest에서 w03이 263시간 동안 active인 채 송신 0바이트였고
+#   (제어서버 연결·외부통신 모두 정상, 마커에도 오류 없음) 재시작 한 번에 10분 36MB로 돌아왔다.
+#   host도 4.2MB/h로 마비돼 있었다. earnapp은 안 죽고 조용히 일을 놓는다 — Restart=always도,
+#   FD 감시(임계 500)도 이걸 못 잡는다. 관측된 좀비는 소켓 212~414개였고 정상은 43~82개였다.
+#   그래서 소켓 수 대신 IPAccounting 누적 송신량의 증가를 지표로 삼는다(증상 자체를 재는 쪽).
+# 창 안에 최소량도 못 보내면 unhealthy → 공통 엔진의 백오프가 재시작한다.
+EARNAPP_IDLE_WINDOW="${EARNAPP_IDLE_WINDOW:-3600}"          # 관찰 창(초)
+EARNAPP_IDLE_MIN_BYTES="${EARNAPP_IDLE_MIN_BYTES:-1048576}" # 창 안에 이만큼도 못 보내면 정체(1MB)
+# ⚠️ 트래픽 0만으로 재시작하면 안 된다. 정체에는 원인이 둘이고 처방이 반대다(2026-09-05 실측):
+#   소켓 200~414 + 트래픽 0 → 좀비. 재시작이 듣는다(w03: 263시간 0바이트 → 재시작 후 85MB/12분).
+#   소켓  3~6   + 트래픽 0 → 일 자체가 배정되지 않음(IP 밴/불량 IP). 재시작은 무의미한 churn이고
+#                            처방은 MAC 교체다. 흔들지 말고 사람에게 알려야 한다.
+# 그래서 소켓 수로 두 유형을 갈라, 좀비만 재시작하고 미배정은 grace로 둔다(재시작·push 모두 보류
+# → Kuma down으로 사람이 본다).
+EARNAPP_ZOMBIE_SOCKETS="${EARNAPP_ZOMBIE_SOCKETS:-150}"
+# 관측된 소켓 수 분포: 유휴 2~6, 정상 44~102, 좀비 212~414.
+# 아래 상수는 터널 경보(불량 IP 후보) 게이트에만 쓴다 — 헬스 판정에는 쓰지 않는다.
+EARNAPP_IDLE_SOCKETS="${EARNAPP_IDLE_SOCKETS:-20}"
+earnapp_sockets() {  # earnapp_sockets <unit> — cgroup에 프로세스는 1개다(실측)
+  pid="$(systemctl show -p MainPID --value "$1" 2>/dev/null)"
+  [ -n "$pid" ] && [ "$pid" != 0 ] || { echo 0; return; }
+  ls -l "/proc/$pid/fd" 2>/dev/null | grep -c socket
+}
 earnapp_health() {
   unit="$1"
-  systemctl is-active --quiet "$unit" && echo healthy || echo skip
+  systemctl is-active --quiet "$unit" || { echo skip; return; }
+
+  egr="$(systemctl show -p IPEgressBytes --value "$unit" 2>/dev/null)"
+  ent="$(systemctl show -p ActiveEnterTimestampMonotonic --value "$unit" 2>/dev/null)"
+  # IPAccounting이 없거나 값을 못 읽으면 예전처럼 active만 보고 넘어간다(오판보다 무개입).
+  case "${egr:-x}" in ''|*[!0-9]*) echo healthy; return ;; esac
+
+  f="$STATE_DIR/ea_$(systemd-escape "$unit" 2>/dev/null || echo "$unit" | tr '/' '_')"
+  p_ent=""; p_ts=""; p_egr=""
+  [ -f "$f" ] && read -r p_ent p_ts p_egr < "$f" 2>/dev/null
+  now=$(awk '{print int($1)}' /proc/uptime)
+
+  # 유닛이 재기동되면 IPEgressBytes가 0으로 리셋된다 → 기준선을 새로 잡는다.
+  if [ "$ent" != "$p_ent" ]; then
+    printf '%s %s %s\n' "$ent" "$now" "$egr" > "$f"; echo healthy; return
+  fi
+  # 창 안에 최소량 이상 진전이 있었다 → 정상이고 창을 리셋한다.
+  if [ "$egr" -ge $(( ${p_egr:-0} + EARNAPP_IDLE_MIN_BYTES )) ]; then
+    printf '%s %s %s\n' "$ent" "$now" "$egr" > "$f"; echo healthy; return
+  fi
+  # 창을 다 쓰기 전에는 판단을 보류한다.
+  [ $(( now - ${p_ts:-$now} )) -ge "$EARNAPP_IDLE_WINDOW" ] || { echo healthy; return; }
+
+  # 정체 확정. 소켓 수로 좀비와 미배정을 가른다.
+  sk="$(earnapp_sockets "$unit")"
+  if [ "${sk:-0}" -ge "$EARNAPP_ZOMBIE_SOCKETS" ]; then
+    echo unhealthy      # 소켓 과다 + 정체 → 좀비. 백오프 재시작이 듣는다.
+  else
+    # ⚠️ 소켓이 적은 정체는 "고장"이 아니다. earnapp 릴레이는 수요 기반이라 몇 시간씩
+    # 조용할 수 있고, 실제로 w02가 소켓 3/송신 0에서 아무 조치 없이 소켓 44/6MB로 스스로
+    # 돌아왔다(2026-09-05). 여기서 down을 띄우면 헛알림만 쌓인다. 밴 여부는 워치독이
+    # 알 수 없고(밴은 IP 스코어 하락의 결과다) EarnApp 대시보드에서 사람이 본다.
+    echo healthy
+  fi
 }
 
 # ── 공통 엔진: 판정 → push/리셋 또는 백오프 재시작 ──────────────────────────────
@@ -201,8 +255,15 @@ for f in /etc/default/earnapp-worker*; do
   err=0
   [ -e "$dir" ] && ls "$dir" 2>/dev/null | grep -q 'perr_tun_init_err' && err=1
   nr=$(systemctl show "$eunit" -p NRestarts --value 2>/dev/null)
+  # ⚠️ perr_* 마커는 한 번 생기면 지워지지 않는다(…sent 파일이 상주). 마커만 보면 이미 회복해
+  # 잘 벌고 있는 노드까지 오탐한다(2026-09-05: w01이 12분 28MB인데 tun_err=1로 잡혔다).
+  # 그래서 "지금 일을 못 받고 있는가"를 소켓 수로 함께 확인한다 — 정상 노드는 41~82개,
+  # 불량 IP로 터널을 못 여는 노드는 3~6개였다.
+  sk=$(earnapp_sockets "$eunit")
   if [ "$err" -eq 1 ] || [ "${nr:-0}" -ge "$EARNAPP_RESTART_THRESHOLD" ]; then
-    ea_alert="$ea_alert $eunit(restarts=${nr:-0},tun_err=$err)"
+    if [ "${sk:-0}" -lt "$EARNAPP_IDLE_SOCKETS" ]; then
+      ea_alert="$ea_alert $eunit(restarts=${nr:-0},tun_err=$err,sockets=${sk:-0})"
+    fi
   fi
 done
 ea_url="$(hb_url /etc/default/earnapp-tunnel-alert)"
