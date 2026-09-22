@@ -79,6 +79,13 @@ ensure_base() {  # ensure_base <parent-nic>
     put systemd/proxyware-watchdog.timer     "$UNIT/proxyware-watchdog.timer"
     put bin/proxyware-watchdog.sh            "$BIN/proxyware-watchdog.sh"  755
 
+    # earnfm 기기 동의 자동 등록.
+    # earnfm supplier 계정은 동의가 기록된 기기만 수익을 인정한다. 그런데 device_id는
+    # 클라이언트가 접속할 때마다 새로 만드는 난수라(디스크에 안 남는다) 미리 등록해둘 수 없다.
+    # 기동 직후 프로세스 메모리에 잠깐 남는 값을 읽어 등록하는 방식이라 상주 데몬이 필요하다.
+    put bin/earnfm-consentd                  "$SBIN/earnfm-consentd"        755
+    put systemd/earnfm-consentd.service      "$UNIT/earnfm-consentd.service"
+
     # earnapp FD 누수 감시 (earnapp을 안 쓰는 호스트에서도 유닛만 깔려 있고 유휴다)
     put bin/earnapp-fd-monitor.sh            "$BIN/earnapp-fd-monitor.sh"   755
     put bin/earnapp-register.sh              "$BIN/earnapp-register.sh"     755
@@ -92,6 +99,7 @@ ensure_base() {  # ensure_base <parent-nic>
     fi
     systemctl daemon-reload
     systemctl enable --now proxyware-watchdog.timer
+    systemctl enable --now earnfm-consentd.service
 }
 
 # Kuma 모니터를 보장하고 push URL을 돌려줍니다. (--kuma-* 없으면 빈 문자열)

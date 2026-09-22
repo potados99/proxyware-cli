@@ -1,0 +1,17 @@
+[Unit]
+Description=earnfm consent 자동 등록 데몬
+Documentation=https://sdk-docs.earn.fm/get-started/consent-api/
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/sbin/earnfm-consentd
+Restart=always
+RestartSec=10
+# deviceName을 읽으려면 워커 프로세스의 /proc/PID/mem에 접근해야 한다.
+# 워커는 PrivatePIDs=yes라 유닛 안에서는 불가능하고, 호스트 PID 네임스페이스인 여기서만 된다.
+Slice=proxyware.slice
+
+[Install]
+WantedBy=multi-user.target

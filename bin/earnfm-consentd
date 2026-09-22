@@ -1,0 +1,115 @@
+#!/usr/bin/env python3
+"""earnfm 기기 동의(consent) 자동 등록 데몬.
+
+earnfm 클라이언트는 접속할 때 deviceName을 `linux Linux <uname -r> <난수>` 형태로 만들어 보낸다.
+이 값은 재시작마다 새로 생기고 어디에도 저장되지 않으며, 프로세스 메모리에 잠깐만 남는다.
+supplier 계정은 동의가 기록된 기기만 수익을 인정하므로, 기동 직후 메모리에서 읽어 API로 등록한다.
+
+워커 유닛은 PrivatePIDs=yes라 유닛 안(ExecStartPost)에서는 자기 메모리를 못 읽는다.
+그래서 호스트 PID 네임스페이스에 사는 이 데몬이 대신 훑는다.
+"""
+import json, os, re, subprocess, time, urllib.parse, urllib.request
+
+STATE = "/run/earnfm-consent"
+POLL = 2
+CONSENT_TEXT = ("I consent to share my device's unused internet bandwidth through the EarnFM network "
+                "in exchange for rewards. I am the owner of this device and its internet connection. "
+                "I understand traffic from other users may be routed through my connection, and I can "
+                "withdraw this consent at any time by revoking it.")
+PAT = re.compile(rb'linux(?:%20| )Linux(?:%20| )[^\x00"&\s]{1,80}')
+UA = {"Content-Type": "application/json", "User-Agent": "curl/8.14.1", "Accept": "*/*"}
+
+
+def units():
+    out = subprocess.run(["systemctl", "list-units", "--all", "--no-legend", "--plain",
+                          "earnfm-host.service", "earnfm-worker@*.service"],
+                         capture_output=True, text=True).stdout
+    return [l.split()[0] for l in out.splitlines() if l.strip()]
+
+
+def prop(unit, *names):
+    out = subprocess.run(["systemctl", "show", unit] + [f"-p{n}" for n in names],
+                         capture_output=True, text=True).stdout
+    return dict(l.split("=", 1) for l in out.splitlines() if "=" in l)
+
+
+def token(unit):
+    base = unit.replace(".service", "").replace("earnfm-worker@", "earnfm-worker").replace("@", "")
+    try:
+        for line in open("/etc/default/" + base):
+            if line.startswith("EARNFM_TOKEN="):
+                return line.split("=", 1)[1].strip().strip('"')
+    except OSError:
+        return ""
+    return ""
+
+
+def scan(pid):
+    """프로세스 메모리에서 deviceName 후보를 뽑는다. 읽기 가능한 무명 영역만 본다(속도)."""
+    found = set()
+    try:
+        mem = open(f"/proc/{pid}/mem", "rb", 0)
+        maps = open(f"/proc/{pid}/maps")
+    except OSError:
+        return found
+    for line in maps:
+        p = line.split()
+        if len(p) < 2 or "r" not in p[1]:
+            continue
+        if len(p) > 5 and p[5].startswith("/"):
+            continue
+        a, b = (int(x, 16) for x in p[0].split("-"))
+        if b - a > 256 * 1024 * 1024:
+            continue
+        try:
+            mem.seek(a)
+            buf = mem.read(b - a)
+        except Exception:
+            continue
+        for m in PAT.findall(buf):
+            s = urllib.parse.unquote(m.decode("utf-8", "ignore")).strip()
+            if re.search(r"\s\d{3,6}$", s):
+                found.add(s)
+    return found
+
+
+def grant(dev, key):
+    body = json.dumps({"action": "grant", "device_id": dev, "consent_text": CONSENT_TEXT}).encode()
+    req = urllib.request.Request(f"https://api.earn.fm/v2/consent?apikey={key}", data=body, headers=UA)
+    for _ in range(5):
+        try:
+            with urllib.request.urlopen(req, timeout=20) as r:
+                if json.loads(r.read()).get("data", {}).get("status") == "granted":
+                    return True
+        except Exception:
+            pass
+        time.sleep(4)
+    return False
+
+
+os.makedirs(STATE, exist_ok=True)
+seen = {}
+while True:
+    for unit in units():
+        d = prop(unit, "MainPID", "InvocationID", "ActiveState")
+        pid, inv = d.get("MainPID", "0"), d.get("InvocationID", "")
+        if d.get("ActiveState") != "active" or pid in ("0", "") or not inv:
+            continue
+        if seen.get(unit) == inv:
+            continue
+        names = scan(pid)
+        if not names:
+            continue
+        for n in list(names):
+            if "+" in n:                      # 대시보드는 '+'를 공백으로 표시한다. 양쪽 다 등록.
+                names.add(n.replace("+", " "))
+        key = token(unit)
+        if not key:
+            continue
+        ok = [n for n in sorted(names) if grant(n, key)]
+        if ok:
+            seen[unit] = inv
+            with open(os.path.join(STATE, unit), "w") as f:
+                f.write("\n".join(ok) + "\n")
+            print(f"{unit}: 동의 등록 {ok}", flush=True)
+    time.sleep(POLL)

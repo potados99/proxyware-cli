@@ -58,6 +58,26 @@ sudo earnapp-register.sh 01 03 host # 지정
 - FD 누수 감시(`earnapp-fd-monitor.timer`)가 함께 켜집니다. earnapp은 릴레이라 평시 FD가 26~62(스파이크 110~127)이므로 임계는 **500**입니다. 낮추면 건강한 워커를 죽입니다.
 - 특정 IP가 터널 협상을 못 끝내 무한 크래시루프에 빠지는 경우가 있습니다. 워치독이 `perr_tun_init_err`와 `NRestarts`로 감지해 `EARNAPP_TUNNEL_ALERT`를 냅니다. **처방은 MAC 교체(IP 교체)** 이며, 재시작이나 uuid 재발급으로는 낫지 않습니다.
 
+### earnfm 기기 동의(consent)
+
+earnfm을 **supplier 계정**으로 쓰면 동의가 기록된 기기만 수익을 인정합니다.
+그런데 등록에 쓰는 `device_id`가 까다롭습니다.
+
+- 클라이언트는 접속할 때 `linux Linux <uname -r> <난수 5자리>`를 **즉석에서 만들어** 보냅니다.
+- 디스크 어디에도 남기지 않고, **재시작하면 다른 난수**가 됩니다. 즉 손으로 등록해두면 재시작 한 번에 무효가 됩니다.
+- 이 값은 기동 직후 몇 초 동안 프로세스 메모리에만 존재합니다.
+
+그래서 `earnfm-consentd`가 상주하며 2초 주기로 earnfm 유닛을 보고, 새 기동을 발견하면
+메모리에서 `device_id`를 읽어 `POST api.earn.fm/v2/consent`로 동의를 등록합니다.
+결과는 `/run/earnfm-consent/<unit>`에 남습니다.
+
+알아둘 것:
+
+- **`ExecStartPost`로는 안 됩니다.** 워커 유닛은 `PrivatePIDs=yes`라 유닛 안에서는 자기 `/proc/PID/mem`에 접근할 수 없습니다. 호스트 PID 네임스페이스에 사는 별도 데몬이어야 합니다.
+- `api.earn.fm`은 **파이썬 기본 User-Agent를 403으로 막습니다.** `User-Agent: curl/8.14.1`을 보냅니다.
+- 대시보드는 커널 문자열의 `+`를 공백으로 표시합니다. 서버가 어느 쪽으로 대조하는지 불명확해 **두 형태 모두** 등록합니다.
+- 동의 API는 아무 문자열이나 받아 그 이름으로 기기를 만듭니다. 시험 호출로 계정에 유령 기기를 남기지 마세요.
+
 ## 메모
 
 - 같은 MAC을 쓰면 DHCP에서 같은 IP를 그대로 받습니다(인스턴스 이전 시 IP 보존).
