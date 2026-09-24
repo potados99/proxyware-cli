@@ -63,12 +63,29 @@ backoff_step() { case "$1" in 0) echo 60 ;; 1) echo 120 ;; 2) echo 300 ;; 3) ech
 pawns_health() {
   unit="$1"
   systemctl is-active --quiet "$unit" || { echo skip; return; }
-  last30=$(journalctl -u "$unit" --since "-30min" -o cat 2>/dev/null | grep -oE '"name":"(running|not_running)"' | tail -1)
-  case "$last30" in *not_running*) echo unhealthy; return ;; esac
   age=$(active_secs "$unit")
-  if [ "$(journalctl -u "$unit" -b -o cat 2>/dev/null | grep -c '"name":"running"')" -gt 0 ]; then
-    echo healthy; return
-  fi
+  # 이번 기동 이후 로그만 본다. 예전엔 부팅 전체(-b)에서 running을 찾아서, 한 번이라도 running을 찍은
+  # 유닛은 재시작 후 starting에서 멈춰도 영원히 healthy였다 → Kuma는 초록인데 수익 0.
+  # (2026-09-24: 최신 CLI가 기동 시 가끔 starting에서 멈추는 걸 워치독이 못 잡아 발견.)
+  win=$([ "$age" -lt 86400 ] && echo "$age" || echo 86400)
+  # 수명주기 이벤트만 시간순으로 뽑아, "마지막 running 이후 처음 내려간 시각"을 구한다.
+  # starting만 몇 분 간격으로 반복하는 재접속 루프도 있으니 마지막 starting 시각이 아니라
+  # 내려간 시점부터 잰다.
+  verdict=$(journalctl -u "$unit" --since "-${win}s" -o cat 2>/dev/null \
+    | grep -oE '"happened_at":"[^"]+","name":"(starting|running|not_running)"' \
+    | sed -E 's/"happened_at":"([^"]+)","name":"([a-z_]+)"/\1 \2/' \
+    | awk '{ if ($2 == "running") down = ""; else if (down == "") down = $1; last = $2 }
+           END { if (last == "") print "none"; else if (last == "running") print "up"; else print "down " down }')
+  case "$verdict" in
+    up)   echo healthy; return ;;
+    down\ *)
+      t=${verdict#down }
+      downfor=$(( $(date +%s) - $(date -d "$t" +%s 2>/dev/null || date +%s) ))
+      [ "$downfor" -lt 300 ] && echo grace || echo unhealthy
+      return ;;
+  esac
+  # 이번 기동에 이벤트가 하나도 없다: 막 떴거나, 오래 돌아 초기 로그가 vacuum됐거나.
+  # 장수 워커를 오판해 재시작하지 않도록 30분 넘게 산 유닛은 healthy로 본다.
   if   [ "$age" -lt 300 ];  then echo grace
   elif [ "$age" -le 1800 ]; then echo unhealthy
   else echo healthy
