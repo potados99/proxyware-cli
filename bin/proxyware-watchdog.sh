@@ -17,8 +17,8 @@ mkdir -p "$STATE_DIR" 2>/dev/null
 
 EARNFM_RSS_MAX_KB=204800   # 200 MiB. earnfm(dart) 힙 폭주 회수 기준. 실측 plateau 60~155MB라 128은 아침
 EARNFM_LIMITED_GAP="${EARNFM_LIMITED_GAP:-600}"        # limited 재시작 사이 최소 간격(초)
-EARNFM_LIMITED_WINDOW="${EARNFM_LIMITED_WINDOW:-7200}"  # 연속으로 셀 창(초). 2시간 넘게 조용하면 0부터
-EARNFM_LIMITED_MAX="${EARNFM_LIMITED_MAX:-3}"           # 이 횟수째 limited면 포기하고 정지
+EARNFM_LIMITED_MAX="${EARNFM_LIMITED_MAX:-3}"           # 이 횟수까지는 GAP 간격으로 재시작
+EARNFM_LIMITED_COOLDOWN="${EARNFM_LIMITED_COOLDOWN:-7200}" # 그 뒤로는 이 간격마다 한 번만 재시작(정지는 안 함)
                            # 피크에 정상 워커를 자주 침 → 재시작 유발 → earnfm이 재시작마다 harvester(deviceName)를
                            # 재생성해 유령 기기 양산 + 잦은 재등록 rate limit(user is limited) 위험. 200으로 올려
                            # 재시작을 최소화한다. SidePi(1GB) OOM은 디스크 스왑 2GB가 완충(2026-07-02).
@@ -103,13 +103,18 @@ pawns_health() {
 earnfm_health() {
   unit="$1"
   systemctl is-active --quiet "$unit" || { echo skip; return; }
-  # limited 좀비: 반드시 "이번 세션(재시작 이후)" 로그만 본다. 옛 limited 로그가 저널에 남아 재시작 직후
-  # 즉사시키는 버그를 막기 위해 --since를 active된 시점 이후로 한정하고, 재시작 후 30초는 연결 시도 시간을
-  # 줘 판정을 보류(grace). 창은 부하 방지로 최대 1시간. (2026-07-02 즉사 버그 수정)
+  # 이번 기동 이후의 "마지막 수명주기 줄"로 판정한다. earnfm은 접속 성공 문구를 남기지 않는다.
+  #   - 마지막이 limited → zombie
+  #   - 마지막이 접속 시도(Connecting to ... WebSocket) → 붙었거나 붙는 중 → zombie 아님
+  # limited 뒤 클라이언트가 10분 뒤 스스로 재시도해 붙으면, 마지막 줄이 접속 시도가 되어 곧바로 회복으로 본다.
+  # (예전엔 "창 안에 limited가 한 번이라도 있으면" zombie라, 스스로 회복해도 최대 1시간 down으로 남았다.)
+  # 옛 limited 로그에 속지 않도록 창은 이번 기동 이후로 한정하고, 기동 후 30초는 판정을 보류한다.
   age=$(active_secs "$unit")
-  win=$([ "$age" -lt 3600 ] && echo "$age" || echo 3600)
-  if [ "$age" -ge 30 ] && journalctl -u "$unit" --since "-${win}s" -o cat 2>/dev/null | grep -q "user is limited"; then
-    echo zombie; return
+  if [ "$age" -ge 30 ]; then
+    win=$([ "$age" -lt 86400 ] && echo "$age" || echo 86400)
+    last=$(journalctl -u "$unit" --since "-${win}s" -o cat 2>/dev/null \
+           | grep -oE "user is limited|Connecting to (Primary|Backup|Fallback) WebSocket" | tail -1)
+    [ "$last" = "user is limited" ] && { echo zombie; return; }
   fi
   pid=$(systemctl show "$unit" -p MainPID --value 2>/dev/null)
   { [ -n "$pid" ] && [ "$pid" -gt 0 ] 2>/dev/null; } || { echo healthy; return; }
@@ -193,7 +198,7 @@ handle() {
   state="$STATE_DIR/$(systemd-escape "$unit" 2>/dev/null || echo "$unit" | tr '/' '_')"
   case "$($health_fn "$unit")" in
     healthy)
-      rm -f "$state"
+      rm -f "$state" "$STATE_DIR/lim_$(systemd-escape "$unit" 2>/dev/null || echo "$unit" | tr '/' '_')"
       push "$ns" "$url" && echo "OK  $unit" || echo "PUSH_FAIL $unit" ;;
     grace)
       echo "GRACE $unit" ;;                       # 재시작·push 보류(도달 대기)
@@ -214,27 +219,34 @@ handle() {
         fi
       fi ;;                                        # unhealthy 동안 push 보류(Kuma down)
     zombie)
-      # earnfm "user is limited". 예전(구 계정)엔 계정 단위라 재시작이 무의미해서 곧장 정지했는데,
-      # supplier 전환 후엔 IP 단위이고 일시적인 경우가 많다(2026-09-26 nest w05: 재시작 한 번에 회복).
-      # 그래서 재시작을 시도하되, 막힌 IP를 계속 두드리지 않게 차단기를 둔다.
-      #   - 재시작 사이 최소 EARNFM_LIMITED_GAP초(클라이언트도 스스로 10분마다 재시도한다)
-      #   - EARNFM_LIMITED_WINDOW초 안에 EARNFM_LIMITED_MAX번째 limited면 포기하고 정지 → Kuma down.
-      #     이 IP는 막힌 것이니 MAC 교체(새 IP)가 처방이다. 사람이 다시 켜기 전엔 워치독이 건드리지 않는다.
+      # earnfm "user is limited". 2026-09-27 로그로 확인: earnfm 서버가 주·예비·보조 소켓 모두
+      # 접속을 거부하던 시간이 있었고("The remote server is currently down", "was not upgraded to websocket"),
+      # limited는 그 사고 뒤에 집·IP를 가리지 않고 한 대씩 옮겨 다녔다(nest w05 → w06 → home 호스트).
+      # 새 IP에서도 1초 만에 막혔으니 IP 밴이 아니라 서버·계정 쪽이다. 그래서:
+      #   - 처음 EARNFM_LIMITED_MAX번은 EARNFM_LIMITED_GAP 간격으로 재시작한다(일시적이면 이걸로 풀린다).
+      #   - 그래도 막히면 정지하지 않고 둔다. 클라이언트가 스스로 10분마다 재시도하고, 붙으면 위 판정이
+      #     곧바로 healthy로 돌린다. 막힌 동안은 push를 안 하니 Kuma는 down으로 보인다.
+      #   - 그 상태로 EARNFM_LIMITED_COOLDOWN마다 한 번만 재시작해 본다(클라이언트 자체가 꼬인 경우 대비).
+      # 재시작은 earnfm에 새 기기 등록을 만들므로 횟수를 아낀다. 영구 정지는 없다 → 사람 손 없이 돌아온다.
       rm -f "$state"
       lim="$STATE_DIR/lim_$(systemd-escape "$unit" 2>/dev/null || echo "$unit" | tr '/' '_')"
       now=$(awk '{print int($1)}' /proc/uptime)
       n=0; t=0; [ -f "$lim" ] && read -r n t < "$lim"
-      [ $(( now - ${t:-0} )) -gt "$EARNFM_LIMITED_WINDOW" ] && n=0   # 창 밖이면 새로 센다
-      if [ "$n" -gt 0 ] && [ $(( now - t )) -lt "$EARNFM_LIMITED_GAP" ]; then
-        echo "LIMITED_WAIT $unit (#$n, $((now - t))s < ${EARNFM_LIMITED_GAP}s)"
-      elif [ $(( n + 1 )) -ge "$EARNFM_LIMITED_MAX" ]; then
-        rm -f "$lim"
-        systemctl stop "$unit"
-        echo "LIMITED_GIVEUP $unit (${EARNFM_LIMITED_MAX}회 연속 limited — IP 밴 추정, MAC 교체 필요)"
-      else
-        echo "$(( n + 1 )) $now" > "$lim"
+      since=$(( now - ${t:-0} ))
+      if [ "$n" -lt "$EARNFM_LIMITED_MAX" ]; then
+        if [ "$n" -eq 0 ] || [ "$since" -ge "$EARNFM_LIMITED_GAP" ]; then
+          echo "$(( n + 1 )) $now" > "$lim"
+          systemctl restart "$unit"
+          echo "LIMITED_RESTART $unit (#$(( n + 1 ))/${EARNFM_LIMITED_MAX})"
+        else
+          echo "LIMITED_WAIT $unit (#$n, ${since}s < ${EARNFM_LIMITED_GAP}s)"
+        fi
+      elif [ "$since" -ge "$EARNFM_LIMITED_COOLDOWN" ]; then
+        echo "$n $now" > "$lim"
         systemctl restart "$unit"
-        echo "LIMITED_RESTART $unit (#$(( n + 1 ))/${EARNFM_LIMITED_MAX})"
+        echo "LIMITED_RETRY $unit (쉬기 ${EARNFM_LIMITED_COOLDOWN}s 끝, 재시작 1회)"
+      else
+        echo "LIMITED_HOLD $unit (클라이언트 자체 재시도 대기, 다음 재시작까지 $(( EARNFM_LIMITED_COOLDOWN - since ))s)"
       fi ;;                                        # push 보류 → Kuma down으로 실측과 일치시킴
     skip) : ;;                                     # 워치독 관여 안 함(inactive 등 → systemd Restart 영역)
   esac

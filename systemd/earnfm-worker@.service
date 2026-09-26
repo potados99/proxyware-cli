@@ -17,6 +17,9 @@ RestartSec=30
 # earnfm(dart)은 SIGTERM을 90초 버틴다 → 정지가 타임아웃·failed로 끝났다. 곧장 죽인다(상태 없음).
 KillSignal=SIGKILL
 TimeoutStopSec=5
+# 트래픽 한 건마다 requestId 줄을 남겨 시간당 1만~1.7만 줄(전체의 99%)이다. 저널 200MB가 2~3일에 차서
+# 다른 로그까지 밀려났다. 이 줄만 버린다. 수명주기(접속·limited·서버 다운) 줄은 requestId가 없어 남는다.
+LogFilterPatterns=~requestId
 ProtectHostname=yes
 PrivatePIDs=yes
 PrivateTmp=yes
