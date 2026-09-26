@@ -10,6 +10,9 @@ EnvironmentFile=/etc/default/earnfm-host
 ExecStart=/usr/local/bin/earnfm
 Restart=always
 RestartSec=30
+# earnfm(dart)은 SIGTERM을 90초 버틴다 → 정지가 타임아웃·failed로 끝났다. 곧장 죽인다(상태 없음).
+KillSignal=SIGKILL
+TimeoutStopSec=5
 
 [Install]
 WantedBy=multi-user.target

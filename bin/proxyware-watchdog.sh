@@ -16,6 +16,9 @@ STATE_DIR=/run/proxyware-wd
 mkdir -p "$STATE_DIR" 2>/dev/null
 
 EARNFM_RSS_MAX_KB=204800   # 200 MiB. earnfm(dart) 힙 폭주 회수 기준. 실측 plateau 60~155MB라 128은 아침
+EARNFM_LIMITED_GAP="${EARNFM_LIMITED_GAP:-600}"        # limited 재시작 사이 최소 간격(초)
+EARNFM_LIMITED_WINDOW="${EARNFM_LIMITED_WINDOW:-7200}"  # 연속으로 셀 창(초). 2시간 넘게 조용하면 0부터
+EARNFM_LIMITED_MAX="${EARNFM_LIMITED_MAX:-3}"           # 이 횟수째 limited면 포기하고 정지
                            # 피크에 정상 워커를 자주 침 → 재시작 유발 → earnfm이 재시작마다 harvester(deviceName)를
                            # 재생성해 유령 기기 양산 + 잦은 재등록 rate limit(user is limited) 위험. 200으로 올려
                            # 재시작을 최소화한다. SidePi(1GB) OOM은 디스크 스왑 2GB가 완충(2026-07-02).
@@ -211,9 +214,28 @@ handle() {
         fi
       fi ;;                                        # unhealthy 동안 push 보류(Kuma down)
     zombie)
+      # earnfm "user is limited". 예전(구 계정)엔 계정 단위라 재시작이 무의미해서 곧장 정지했는데,
+      # supplier 전환 후엔 IP 단위이고 일시적인 경우가 많다(2026-09-26 nest w05: 재시작 한 번에 회복).
+      # 그래서 재시작을 시도하되, 막힌 IP를 계속 두드리지 않게 차단기를 둔다.
+      #   - 재시작 사이 최소 EARNFM_LIMITED_GAP초(클라이언트도 스스로 10분마다 재시도한다)
+      #   - EARNFM_LIMITED_WINDOW초 안에 EARNFM_LIMITED_MAX번째 limited면 포기하고 정지 → Kuma down.
+      #     이 IP는 막힌 것이니 MAC 교체(새 IP)가 처방이다. 사람이 다시 켜기 전엔 워치독이 건드리지 않는다.
       rm -f "$state"
-      systemctl stop "$unit"                       # earnfm limited: 재시작 무의미 → 정지(사람 개입 대기)
-      echo "ZOMBIE_STOP $unit (user is limited)" ;;  # push 보류 → Kuma down으로 실측과 일치시킴
+      lim="$STATE_DIR/lim_$(systemd-escape "$unit" 2>/dev/null || echo "$unit" | tr '/' '_')"
+      now=$(awk '{print int($1)}' /proc/uptime)
+      n=0; t=0; [ -f "$lim" ] && read -r n t < "$lim"
+      [ $(( now - ${t:-0} )) -gt "$EARNFM_LIMITED_WINDOW" ] && n=0   # 창 밖이면 새로 센다
+      if [ "$n" -gt 0 ] && [ $(( now - t )) -lt "$EARNFM_LIMITED_GAP" ]; then
+        echo "LIMITED_WAIT $unit (#$n, $((now - t))s < ${EARNFM_LIMITED_GAP}s)"
+      elif [ $(( n + 1 )) -ge "$EARNFM_LIMITED_MAX" ]; then
+        rm -f "$lim"
+        systemctl stop "$unit"
+        echo "LIMITED_GIVEUP $unit (${EARNFM_LIMITED_MAX}회 연속 limited — IP 밴 추정, MAC 교체 필요)"
+      else
+        echo "$(( n + 1 )) $now" > "$lim"
+        systemctl restart "$unit"
+        echo "LIMITED_RESTART $unit (#$(( n + 1 ))/${EARNFM_LIMITED_MAX})"
+      fi ;;                                        # push 보류 → Kuma down으로 실측과 일치시킴
     skip) : ;;                                     # 워치독 관여 안 함(inactive 등 → systemd Restart 영역)
   esac
 }
