@@ -19,6 +19,7 @@ EARNFM_RSS_MAX_KB=204800   # 200 MiB. earnfm(dart) 힙 폭주 회수 기준. 실
 EARNFM_LIMITED_GAP="${EARNFM_LIMITED_GAP:-600}"        # limited 재시작 사이 최소 간격(초)
 EARNFM_LIMITED_MAX="${EARNFM_LIMITED_MAX:-3}"           # 이 횟수까지는 GAP 간격으로 재시작
 EARNFM_LIMITED_COOLDOWN="${EARNFM_LIMITED_COOLDOWN:-7200}" # 그 뒤로는 이 간격마다 한 번만 재시작(정지는 안 함)
+EARNFM_LIMITED_RESET="${EARNFM_LIMITED_RESET:-14400}"     # 마지막 재시작 뒤 이만큼 limited가 없었으면 카운터 초기화(4시간)
                            # 피크에 정상 워커를 자주 침 → 재시작 유발 → earnfm이 재시작마다 harvester(deviceName)를
                            # 재생성해 유령 기기 양산 + 잦은 재등록 rate limit(user is limited) 위험. 200으로 올려
                            # 재시작을 최소화한다. SidePi(1GB) OOM은 디스크 스왑 2GB가 완충(2026-07-02).
@@ -198,7 +199,10 @@ handle() {
   state="$STATE_DIR/$(systemd-escape "$unit" 2>/dev/null || echo "$unit" | tr '/' '_')"
   case "$($health_fn "$unit")" in
     healthy)
-      rm -f "$state" "$STATE_DIR/lim_$(systemd-escape "$unit" 2>/dev/null || echo "$unit" | tr '/' '_')"
+      # limited 카운터(lim_*)는 여기서 지우지 않는다. limited 뒤 클라이언트가 재접속을 시도하는 몇 초 동안
+      # 마지막 줄이 "접속 시도"라 healthy로 보이는데, 그때 지우면 매번 #1부터 다시 세서 재시작을 쏟아낸다
+      # (2026-09-27 밤 nest w06 45회 재시작, 12시간 송신 0). 카운터는 zombie 쪽에서 오래 조용할 때만 초기화한다.
+      rm -f "$state"
       push "$ns" "$url" && echo "OK  $unit" || echo "PUSH_FAIL $unit" ;;
     grace)
       echo "GRACE $unit" ;;                       # 재시작·push 보류(도달 대기)
@@ -233,6 +237,7 @@ handle() {
       now=$(awk '{print int($1)}' /proc/uptime)
       n=0; t=0; [ -f "$lim" ] && read -r n t < "$lim"
       since=$(( now - ${t:-0} ))
+      [ "$since" -gt "$EARNFM_LIMITED_RESET" ] && n=0   # 마지막 재시작 뒤로 오래 안 막혔으면 새로 센다
       if [ "$n" -lt "$EARNFM_LIMITED_MAX" ]; then
         if [ "$n" -eq 0 ] || [ "$since" -ge "$EARNFM_LIMITED_GAP" ]; then
           echo "$(( n + 1 )) $now" > "$lim"
