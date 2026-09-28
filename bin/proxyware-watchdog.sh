@@ -20,6 +20,13 @@ EARNFM_LIMITED_GAP="${EARNFM_LIMITED_GAP:-600}"        # limited 재시작 사�
 EARNFM_LIMITED_MAX="${EARNFM_LIMITED_MAX:-3}"           # 이 횟수까지는 GAP 간격으로 재시작
 EARNFM_LIMITED_COOLDOWN="${EARNFM_LIMITED_COOLDOWN:-7200}" # 그 뒤로는 이 간격마다 한 번만 재시작(정지는 안 함)
 EARNFM_LIMITED_RESET="${EARNFM_LIMITED_RESET:-14400}"     # 마지막 재시작 뒤 이만큼 limited가 없었으면 카운터 초기화(4시간)
+# earnfm 서버는 접속을 쏟아내는 IP를 방화벽에서 TCP 단계로 막는다(2026-09-28 확정: 막힌 w06은 서버 52대 중 6대만 연결).
+# 막힌 IP에서 재시작·재접속을 계속하면 차단이 길어지므로, limited면 먼저 TCP만 찔러 차단 여부를 본다.
+EARNFM_PROBE_N="${EARNFM_PROBE_N:-8}"              # 찔러볼 socket-prod 서버 수
+EARNFM_BAN_BELOW="${EARNFM_BAN_BELOW:-4}"          # 이보다 적게 붙으면 방화벽 차단으로 본다
+EARNFM_UNBAN_AT="${EARNFM_UNBAN_AT:-6}"            # 이만큼 이상 붙으면 차단이 풀린 것으로 본다
+EARNFM_BAN_RECHECK="${EARNFM_BAN_RECHECK:-3600}"   # 차단 중 재확인 간격(초)
+EARNFM_PROBE_BUDGET="${EARNFM_PROBE_BUDGET:-2}"    # 한 바퀴에 최대 확인 횟수(TimeoutStartSec=45 안에 끝내려고)
                            # 피크에 정상 워커를 자주 침 → 재시작 유발 → earnfm이 재시작마다 harvester(deviceName)를
                            # 재생성해 유령 기기 양산 + 잦은 재등록 rate limit(user is limited) 위험. 200으로 올려
                            # 재시작을 최소화한다. SidePi(1GB) OOM은 디스크 스왑 2GB가 완충(2026-07-02).
@@ -101,6 +108,20 @@ pawns_health() {
 #      이걸 healthy로 오판하면 Kuma에 online으로 뜨나 실제론 죽음(업타임-실측 불일치). 재시작은 무의미
 #      (서버측 판단 + 재시작마다 새 harvester 양산으로 악화)하므로 → zombie 판정 → handle이 stop시킨다.
 #   2) RSS 임계 초과 → unhealthy(백오프 재시작). dart는 spike 후 자가회수하므로 60s 유예로 흡수.
+# earnfm_reach <ns> → socket-prod 서버 표본 중 TCP가 붙는 수(-1: DNS 실패).
+# 클라이언트를 띄우지 않으니 earnfm에 기기 등록도 안 생기고 서버도 거의 안 두드린다. 병렬로 3초 안에 끝난다.
+earnfm_reach() {
+  ns="$1"; if [ "$ns" = "host" ]; then pre=""; else pre="ip netns exec $ns"; fi
+  ips=$($pre getent ahostsv4 socket-prod.earn.fm 2>/dev/null | awk '{print $1}' | sort -u | shuf -n "$EARNFM_PROBE_N" 2>/dev/null)
+  [ -n "$ips" ] || { echo -1; return; }
+  tmp=$(mktemp)
+  for ip in $ips; do
+    ( $pre timeout 3 bash -c "exec 3<>/dev/tcp/$ip/8443" 2>/dev/null && echo ok >> "$tmp" ) &
+  done
+  wait
+  n=$(wc -l < "$tmp"); rm -f "$tmp"; echo "$n"
+}
+
 earnfm_health() {
   unit="$1"
   systemctl is-active --quiet "$unit" || { echo skip; return; }
@@ -197,6 +218,32 @@ earnapp_health() {
 handle() {
   unit="$1"; ns="$2"; url="$3"; health_fn="$4"
   state="$STATE_DIR/$(systemd-escape "$unit" 2>/dev/null || echo "$unit" | tr '/' '_')"
+  esc="$(systemd-escape "$unit" 2>/dev/null || echo "$unit" | tr '/' '_')"
+  ban="$STATE_DIR/ban_$esc"
+  if [ -f "$ban" ]; then
+    # 방화벽 차단으로 세워둔 earnfm. 사람이 직접 켰으면 그 판단을 따른다.
+    if systemctl is-active --quiet "$unit"; then
+      rm -f "$ban"
+    else
+      now=$(awk '{print int($1)}' /proc/uptime); last=$(cat "$ban" 2>/dev/null)
+      if [ $(( now - ${last:-0} )) -lt "$EARNFM_BAN_RECHECK" ]; then
+        return                                    # 조용히 기다린다(매분 로그를 남기지 않는다)
+      elif [ "$EARNFM_PROBE_BUDGET" -le 0 ]; then
+        return                                    # 이번 바퀴 확인 한도 소진 → 다음 분에
+      fi
+      EARNFM_PROBE_BUDGET=$(( EARNFM_PROBE_BUDGET - 1 ))
+      r=$(earnfm_reach "$ns")
+      if [ "$r" -ge "$EARNFM_UNBAN_AT" ]; then
+        rm -f "$ban" "$STATE_DIR/lim_$esc"
+        systemctl start "$unit"
+        echo "EARNFM_UNBANNED $unit (서버 ${r}/${EARNFM_PROBE_N} 연결 — 차단 풀림, 재개)"
+      else
+        echo "$now" > "$ban"
+        echo "EARNFM_BAN_HOLD $unit (서버 ${r}/${EARNFM_PROBE_N}만 연결 — 아직 차단, ${EARNFM_BAN_RECHECK}s 뒤 재확인)"
+      fi
+      return
+    fi
+  fi
   case "$($health_fn "$unit")" in
     healthy)
       # limited 카운터(lim_*)는 여기서 지우지 않는다. limited 뒤 클라이언트가 재접속을 시도하는 몇 초 동안
@@ -233,8 +280,21 @@ handle() {
       #   - 그 상태로 EARNFM_LIMITED_COOLDOWN마다 한 번만 재시작해 본다(클라이언트 자체가 꼬인 경우 대비).
       # 재시작은 earnfm에 새 기기 등록을 만들므로 횟수를 아낀다. 영구 정지는 없다 → 사람 손 없이 돌아온다.
       rm -f "$state"
-      lim="$STATE_DIR/lim_$(systemd-escape "$unit" 2>/dev/null || echo "$unit" | tr '/' '_')"
+      lim="$STATE_DIR/lim_$esc"
       now=$(awk '{print int($1)}' /proc/uptime)
+      # 먼저 방화벽 차단인지 TCP로만 확인한다. 차단이면 재시작은 차단을 늘릴 뿐이니 세워두고 기다린다.
+      if [ "$EARNFM_PROBE_BUDGET" -le 0 ]; then
+        echo "LIMITED_DEFER $unit (이번 바퀴 확인 한도 소진)"; return
+      fi
+      EARNFM_PROBE_BUDGET=$(( EARNFM_PROBE_BUDGET - 1 ))
+      r=$(earnfm_reach "$ns")
+      if [ "$r" -ge 0 ] && [ "$r" -lt "$EARNFM_BAN_BELOW" ]; then
+        echo "$now" > "$ban"; rm -f "$lim"
+        systemctl stop "$unit"
+        echo "EARNFM_BANNED $unit (서버 ${r}/${EARNFM_PROBE_N}만 연결 — 방화벽 차단, 정지 후 ${EARNFM_BAN_RECHECK}s마다 TCP로만 재확인)"
+        return
+      fi
+      # 서버엔 붙는데 limited → 방화벽이 아닌 제한. 아래 재시작 규칙을 따른다.
       n=0; t=0; [ -f "$lim" ] && read -r n t < "$lim"
       since=$(( now - ${t:-0} ))
       [ "$since" -gt "$EARNFM_LIMITED_RESET" ] && n=0   # 마지막 재시작 뒤로 오래 안 막혔으면 새로 센다
