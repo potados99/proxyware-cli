@@ -167,8 +167,6 @@ EARNAPP_IDLE_MIN_BYTES="${EARNAPP_IDLE_MIN_BYTES:-1048576}" # 창 안에 이만�
 # → Kuma down으로 사람이 본다).
 EARNAPP_ZOMBIE_SOCKETS="${EARNAPP_ZOMBIE_SOCKETS:-150}"
 # 관측된 소켓 수 분포: 유휴 2~6, 정상 44~102, 좀비 212~414.
-# 아래 상수는 터널 경보(불량 IP 후보) 게이트에만 쓴다 — 헬스 판정에는 쓰지 않는다.
-EARNAPP_IDLE_SOCKETS="${EARNAPP_IDLE_SOCKETS:-20}"
 earnapp_sockets() {  # earnapp_sockets <unit> — cgroup에 프로세스는 1개다(실측)
   pid="$(systemctl show -p MainPID --value "$1" 2>/dev/null)"
   [ -n "$pid" ] && [ "$pid" != 0 ] || { echo 0; return; }
@@ -357,33 +355,31 @@ else
 fi
 
 # ── earnapp IP 터널 실패 경보 ───────────────────────────────────────────────────
-# earnapp은 "특정 IP만 터널 협상을 못 끝내는" 실패가 있다(2026-08-20 nest w01: 재시작 264회,
-# 수익 0). 증상은 무한 크래시루프이고, 판별 지표는 두 개다:
-#   ① 상태 디렉토리에 perr_tun_init_err 가 상주 (성공하면 tun_start/tun_1b/udp_..._success가 뜬다)
-#   ② NRestarts 급증
-# 원인은 그 IP의 경로이므로 재시작·uuid 재발급으로는 안 낫는다 → MAC 교체(IP 교체)가 처방이다.
-# 사람이 판단할 일이라 자동 조치는 하지 않고 경보만 띄운다.
+# earnapp 서버는 IP마다 터널 서버를 배정하는데, 가끔 죽은 서버를 준다(2026-09-24 nest w04:
+# 45.76.152.91, 2026-09-29 home w01: 45.77.243.24). 그 IP에서는 안 풀리고 재시작·uuid 재발급도
+# 소용없다 → MAC 교체(IP 교체)가 처방이다. 사람이 판단할 일이라 경보만 띄운다.
+# 지표: 최근 1시간의 "Handshake timeout" 횟수. 3일치 실측(24노드)에서 고장 노드는 시간당 28회,
+#   정상 노드는 최대 1회였다 → 문턱 10.
+# ⚠️ 예전 게이트(perr_tun_init_err 마커 + NRestarts + 소켓 수)는 쓰지 않는다. 마커는 한번 생기면
+#   지워지지 않고 재시작 직후엔 소켓이 잠깐 적어서, 3일간 home에서만 1,585번(거의 전 노드) 떴다.
+# journalctl을 노드마다 읽는 비용 때문에 10분에 한 번만 다시 세고, 그 사이엔 지난 결과를 쓴다.
 # 채널: /etc/default/earnapp-tunnel-alert 의 HEARTBEAT_URL (없으면 로그만 남는다)
-EARNAPP_RESTART_THRESHOLD="${EARNAPP_RESTART_THRESHOLD:-20}"
-ea_alert=""
-for f in /etc/default/earnapp-worker*; do
-  [ -e "$f" ] || continue
-  eid="${f##*/earnapp-worker}"; eunit="earnapp-worker@$eid"
-  dir="/etc/proxyware/earnapp/w$eid"
-  err=0
-  [ -e "$dir" ] && ls "$dir" 2>/dev/null | grep -q 'perr_tun_init_err' && err=1
-  nr=$(systemctl show "$eunit" -p NRestarts --value 2>/dev/null)
-  # ⚠️ perr_* 마커는 한 번 생기면 지워지지 않는다(…sent 파일이 상주). 마커만 보면 이미 회복해
-  # 잘 벌고 있는 노드까지 오탐한다(2026-09-05: w01이 12분 28MB인데 tun_err=1로 잡혔다).
-  # 그래서 "지금 일을 못 받고 있는가"를 소켓 수로 함께 확인한다 — 정상 노드는 41~82개,
-  # 불량 IP로 터널을 못 여는 노드는 3~6개였다.
-  sk=$(earnapp_sockets "$eunit")
-  if [ "$err" -eq 1 ] || [ "${nr:-0}" -ge "$EARNAPP_RESTART_THRESHOLD" ]; then
-    if [ "${sk:-0}" -lt "$EARNAPP_IDLE_SOCKETS" ]; then
-      ea_alert="$ea_alert $eunit(restarts=${nr:-0},tun_err=$err,sockets=${sk:-0})"
-    fi
-  fi
-done
+EARNAPP_HANDSHAKE_THRESHOLD="${EARNAPP_HANDSHAKE_THRESHOLD:-10}"
+EARNAPP_TUNNEL_CHECK_EVERY="${EARNAPP_TUNNEL_CHECK_EVERY:-600}"
+ea_cache="$STATE_DIR/ea_tunnel"
+now=$(awk '{print int($1)}' /proc/uptime)
+ea_last=""; ea_alert=""
+[ -f "$ea_cache" ] && { read -r ea_last; IFS= read -r ea_alert; } < "$ea_cache" 2>/dev/null
+if [ -z "$ea_last" ] || [ $(( now - ea_last )) -ge "$EARNAPP_TUNNEL_CHECK_EVERY" ] || [ "$ea_last" -gt "$now" ]; then
+  ea_alert=""
+  for f in /etc/default/earnapp-worker* /etc/default/earnapp-host; do
+    [ -e "$f" ] || continue
+    case "$f" in *-host) eunit="earnapp-host" ;; *) eunit="earnapp-worker@${f##*/earnapp-worker}" ;; esac
+    hs=$(journalctl -u "$eunit" --since "-1h" --no-pager -o cat 2>/dev/null | grep -ci 'handshake timeout')
+    [ "${hs:-0}" -ge "$EARNAPP_HANDSHAKE_THRESHOLD" ] && ea_alert="$ea_alert $eunit(handshake_timeout_1h=$hs)"
+  done
+  printf '%s\n%s\n' "$now" "$ea_alert" > "$ea_cache"
+fi
 ea_url="$(hb_url /etc/default/earnapp-tunnel-alert)"
 if [ -n "$ea_alert" ]; then
   logger -t proxyware-watchdog "EARNAPP_TUNNEL_ALERT IP 터널 실패 의심(MAC 교체 검토):$ea_alert"
