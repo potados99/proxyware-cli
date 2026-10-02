@@ -20,7 +20,8 @@ cid="$(docker create $PA "$IMAGE")"
 trap 'docker rm -f "$cid" >/dev/null 2>&1 || true' EXIT
 
 tmp="$(mktemp -d)"
-docker cp "$cid:/app/earnfm_example" "$tmp/earnfm"
+# 2026-09-10 이미지부터 Go 클라이언트 /app/main (이전 Dart 빌드는 /app/earnfm_example)
+docker cp "$cid:/app/main" "$tmp/earnfm" 2>/dev/null || docker cp "$cid:/app/earnfm_example" "$tmp/earnfm"
 tar -C "$tmp" -czf "$OUT" earnfm
 rm -rf "$tmp"
 
