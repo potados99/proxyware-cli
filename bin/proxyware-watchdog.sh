@@ -22,6 +22,7 @@ EARNFM_LIMITED_COOLDOWN="${EARNFM_LIMITED_COOLDOWN:-7200}" # 그 뒤로는 이 �
 EARNFM_LIMITED_RESET="${EARNFM_LIMITED_RESET:-14400}"     # 마지막 재시작 뒤 이만큼 limited가 없었으면 카운터 초기화(4시간)
 # earnfm 서버는 접속을 쏟아내는 IP를 방화벽에서 TCP 단계로 막는다(2026-09-28 확정: 막힌 w06은 서버 52대 중 6대만 연결).
 # 막힌 IP에서 재시작·재접속을 계속하면 차단이 길어지므로, limited면 먼저 TCP만 찔러 차단 여부를 본다.
+EARNFM_NOCONN_MAX="${EARNFM_NOCONN_MAX:-600}"   # :8443 연결 없이 이만큼(초) 지나면 zombie
 EARNFM_PROBE_N="${EARNFM_PROBE_N:-8}"              # 찔러볼 socket-prod 서버 수
 EARNFM_BAN_BELOW="${EARNFM_BAN_BELOW:-4}"          # 이보다 적게 붙으면 방화벽 차단으로 본다
 EARNFM_UNBAN_AT="${EARNFM_UNBAN_AT:-6}"            # 이만큼 이상 붙으면 차단이 풀린 것으로 본다
@@ -140,6 +141,20 @@ earnfm_health() {
   fi
   pid=$(systemctl show "$unit" -p MainPID --value 2>/dev/null)
   { [ -n "$pid" ] && [ "$pid" -gt 0 ] 2>/dev/null; } || { echo healthy; return; }
+  # 서버 연결 자체를 본다(2026-10-03). Go 클라이언트(9/10 이미지~)는 limited·재접속 같은 수명주기 줄을
+  # 거의 남기지 않아 위 로그 판정이 듣지 않는다. 대신 earnfm 프로세스의 :8443 ESTAB을 센다(Dart도 같다).
+  # EARNFM_NOCONN_MAX초 넘게 연결이 없으면 zombie → 엔진이 먼저 TCP로 방화벽 차단부터 확인한다.
+  # 기준 시각은 "마지막으로 연결을 본 때"와 "이번 기동 시각" 중 늦은 쪽이다(재시작 직후 오판 방지).
+  c=$(nsenter -t "$pid" -n ss -Htnp state established '( dport = :8443 )' 2>/dev/null | grep -c "pid=$pid,")
+  cf="$STATE_DIR/efc_$(systemd-escape "$unit" 2>/dev/null || echo "$unit" | tr '/' '_')"
+  now=$(awk '{print int($1)}' /proc/uptime)
+  if [ "${c:-0}" -gt 0 ]; then
+    echo "$now" > "$cf"
+  else
+    seen=$(cat "$cf" 2>/dev/null); start=$(( now - age ))
+    [ "${seen:-0}" -gt "$start" ] || seen=$start
+    [ $(( now - seen )) -ge "$EARNFM_NOCONN_MAX" ] && { echo zombie; return; }
+  fi
   rss=$(awk '/^VmRSS:/{print $2}' /proc/"$pid"/status 2>/dev/null)
   { [ -n "$rss" ] && [ "$rss" -gt "$EARNFM_RSS_MAX_KB" ]; } && echo unhealthy || echo healthy
 }

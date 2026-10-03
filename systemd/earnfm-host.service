@@ -7,10 +7,13 @@ StartLimitIntervalSec=0
 [Service]
 IPAccounting=yes
 EnvironmentFile=/etc/default/earnfm-host
+# 장치 ID(Go 클라이언트)는 EARNFM_DATA_DIR/deviceid에 남는다. 호스트는 자기 /etc/machine-id를 쓴다.
+Environment=EARNFM_DATA_DIR=/var/lib/earnfm/host
+ExecStartPre=+/bin/mkdir -p /var/lib/earnfm/host
 ExecStart=/usr/local/bin/earnfm
 Restart=always
 RestartSec=30
-# earnfm(dart)은 SIGTERM을 90초 버틴다 → 정지가 타임아웃·failed로 끝났다. 곧장 죽인다(상태 없음).
+# earnfm(dart)은 SIGTERM을 90초 버텼다 → 정지가 타임아웃·failed로 끝났다. 곧장 죽인다(장치 ID 파일 외 상태 없음).
 KillSignal=SIGKILL
 TimeoutStopSec=5
 # 위 SIGKILL로 멈춘 걸 실패로 치지 않는다(안 그러면 정지할 때마다 failed로 남는다).
