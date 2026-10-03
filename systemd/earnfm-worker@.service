@@ -25,7 +25,7 @@ ExecStartPre=/bin/sh -c "for i in $(seq 30); do ip -4 addr show eth0 | grep -q \
 ExecStart=/usr/bin/unshare --uts --mount --propagation private /bin/sh -c 'mount --bind -o ro /var/lib/earnfm/w%i/machine-id /etc/machine-id && mount --bind /var/lib/earnfm/w%i /etc/earnfm && hostname "$$(hostname | tr A-Z a-z | sed s/pi$$//)-worker%i" && exec /usr/local/bin/earnfm'
 Restart=always
 RestartSec=30
-# earnfm(dart)은 SIGTERM을 90초 버텼다 → 정지가 타임아웃·failed로 끝났다. 곧장 죽인다(장치 ID 파일 외 상태 없음).
+# 정지는 곧장 죽인다(장치 ID 파일 외에 지킬 상태가 없다).
 KillSignal=SIGKILL
 TimeoutStopSec=5
 # 위 SIGKILL로 멈춘 걸 실패로 치지 않는다(안 그러면 정지할 때마다 failed로 남는다).

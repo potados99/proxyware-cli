@@ -1,19 +1,14 @@
 #!/usr/bin/env python3
 """earnfm 기기 동의(consent) 자동 등록 데몬.
 
-earnfm 클라이언트는 접속할 때 deviceName을 `linux Linux <uname -r> <난수>` 형태로 만들어 보낸다.
-이 값은 재시작마다 새로 생기고 어디에도 저장되지 않으며, 프로세스 메모리에 잠깐만 남는다.
-supplier 계정은 동의가 기록된 기기만 수익을 인정하므로, 기동 직후 메모리에서 읽어 API로 등록한다.
-
-2026-09-10 이미지부터 클라이언트가 Go로 새로 짜였다(`/app/main`). 이쪽은 접속 URL에 deviceId(64자리 hex)를
-따로 싣고 deviceName은 `EarnFM Client <hostname>`이라 장치 구분에 못 쓴다. deviceId는
-EARNFM_DATA_DIR의 deviceid 파일(= machine-id)에서 나와 재시작해도 그대로다. 두 클라이언트가 섞여 도는
-동안에는 양쪽 형식을 다 찾는다.
+supplier 계정은 동의가 기록된 기기만 수익을 인정한다. earnfm 클라이언트는 접속 URL에 deviceId(64자리 hex)를
+싣는데, 이 값은 EARNFM_DATA_DIR의 deviceid 파일(= 워커별 machine-id)에서 나온다. 이를 기동 직후
+프로세스 메모리에서 읽어 API로 등록한다(재시작해도 같은 값이라 등록은 사실상 한 번이다).
 
 워커 유닛은 PrivatePIDs=yes라 유닛 안(ExecStartPost)에서는 자기 메모리를 못 읽는다.
 그래서 호스트 PID 네임스페이스에 사는 이 데몬이 대신 훑는다.
 """
-import json, os, re, subprocess, time, urllib.parse, urllib.request
+import json, os, re, subprocess, time, urllib.request
 
 STATE = "/run/earnfm-consent"
 POLL = 2
@@ -21,8 +16,7 @@ CONSENT_TEXT = ("I consent to share my device's unused internet bandwidth throug
                 "in exchange for rewards. I am the owner of this device and its internet connection. "
                 "I understand traffic from other users may be routed through my connection, and I can "
                 "withdraw this consent at any time by revoking it.")
-PAT = re.compile(rb'linux(?:%20| )Linux(?:%20| )[^\x00"&\s]{1,80}')
-PAT_GO = re.compile(rb'deviceId=([0-9a-f]{64})')
+PAT = re.compile(rb'deviceId=([0-9a-f]{64})')
 UA = {"Content-Type": "application/json", "User-Agent": "curl/8.14.1", "Accept": "*/*"}
 
 
@@ -51,7 +45,7 @@ def token(unit):
 
 
 def scan(pid):
-    """프로세스 메모리에서 deviceName 후보를 뽑는다. 읽기 가능한 무명 영역만 본다(속도)."""
+    """프로세스 메모리에서 deviceId 후보를 뽑는다. 읽기 가능한 무명 영역만 본다(속도)."""
     found = set()
     try:
         mem = open(f"/proc/{pid}/mem", "rb", 0)
@@ -73,10 +67,6 @@ def scan(pid):
         except Exception:
             continue
         for m in PAT.findall(buf):
-            s = urllib.parse.unquote(m.decode("utf-8", "ignore")).strip()
-            if re.search(r"\s\d{3,6}$", s):
-                found.add(s)
-        for m in PAT_GO.findall(buf):
             found.add(m.decode())
     return found
 
@@ -117,9 +107,6 @@ while True:
             miss[unit] = (inv, n, time.time() + min(60, POLL * 2 ** n))
             continue
         miss.pop(unit, None)
-        for n in list(names):
-            if "+" in n:                      # 대시보드는 '+'를 공백으로 표시한다. 양쪽 다 등록.
-                names.add(n.replace("+", " "))
         key = token(unit)
         if not key:
             continue

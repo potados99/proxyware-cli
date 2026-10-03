@@ -15,7 +15,7 @@ set -u
 STATE_DIR=/run/proxyware-wd
 mkdir -p "$STATE_DIR" 2>/dev/null
 
-EARNFM_RSS_MAX_KB=204800   # 200 MiB. earnfm(dart) 힙 폭주 회수 기준. 실측 plateau 60~155MB라 128은 아침
+EARNFM_RSS_MAX_KB=204800   # 200 MiB. 메모리 폭주 회수 기준(Go 클라이언트 평소 RSS ~20MB)
 EARNFM_LIMITED_GAP="${EARNFM_LIMITED_GAP:-600}"        # limited 재시작 사이 최소 간격(초)
 EARNFM_LIMITED_MAX="${EARNFM_LIMITED_MAX:-3}"           # 이 횟수까지는 GAP 간격으로 재시작
 EARNFM_LIMITED_COOLDOWN="${EARNFM_LIMITED_COOLDOWN:-7200}" # 그 뒤로는 이 간격마다 한 번만 재시작(정지는 안 함)
@@ -105,10 +105,9 @@ pawns_health() {
 }
 
 # earnfm: active면 healthy(조용함은 정상). 두 예외:
-#   1) limited 좀비 — active인데 earnfm 서버가 "user is limited"로 거부(트래픽 0인데 systemd는 active).
-#      이걸 healthy로 오판하면 Kuma에 online으로 뜨나 실제론 죽음(업타임-실측 불일치). 재시작은 무의미
-#      (서버측 판단 + 재시작마다 새 harvester 양산으로 악화)하므로 → zombie 판정 → handle이 stop시킨다.
-#   2) RSS 임계 초과 → unhealthy(백오프 재시작). dart는 spike 후 자가회수하므로 60s 유예로 흡수.
+#   1) 서버 연결 없음 좀비 — active인데 :8443 연결이 없다(방화벽 차단 등). healthy로 보면 Kuma엔 online인데
+#      실제론 죽어 있다 → zombie 판정 → handle이 TCP 프로브로 차단 여부부터 보고 정지/재시작한다.
+#   2) RSS 임계 초과 → unhealthy(백오프 재시작).
 # earnfm_reach <ns> → socket-prod 서버 표본 중 TCP가 붙는 수(-1: DNS 실패).
 # 클라이언트를 띄우지 않으니 earnfm에 기기 등록도 안 생기고 서버도 거의 안 두드린다. 병렬로 3초 안에 끝난다.
 earnfm_reach() {
@@ -126,23 +125,11 @@ earnfm_reach() {
 earnfm_health() {
   unit="$1"
   systemctl is-active --quiet "$unit" || { echo skip; return; }
-  # 이번 기동 이후의 "마지막 수명주기 줄"로 판정한다. earnfm은 접속 성공 문구를 남기지 않는다.
-  #   - 마지막이 limited → zombie
-  #   - 마지막이 접속 시도(Connecting to ... WebSocket) → 붙었거나 붙는 중 → zombie 아님
-  # limited 뒤 클라이언트가 10분 뒤 스스로 재시도해 붙으면, 마지막 줄이 접속 시도가 되어 곧바로 회복으로 본다.
-  # (예전엔 "창 안에 limited가 한 번이라도 있으면" zombie라, 스스로 회복해도 최대 1시간 down으로 남았다.)
-  # 옛 limited 로그에 속지 않도록 창은 이번 기동 이후로 한정하고, 기동 후 30초는 판정을 보류한다.
   age=$(active_secs "$unit")
-  if [ "$age" -ge 30 ]; then
-    win=$([ "$age" -lt 86400 ] && echo "$age" || echo 86400)
-    last=$(journalctl -u "$unit" --since "-${win}s" -o cat 2>/dev/null \
-           | grep -oE "user is limited|Connecting to (Primary|Backup|Fallback) WebSocket" | tail -1)
-    [ "$last" = "user is limited" ] && { echo zombie; return; }
-  fi
   pid=$(systemctl show "$unit" -p MainPID --value 2>/dev/null)
   { [ -n "$pid" ] && [ "$pid" -gt 0 ] 2>/dev/null; } || { echo healthy; return; }
-  # 서버 연결 자체를 본다(2026-10-03). Go 클라이언트(9/10 이미지~)는 limited·재접속 같은 수명주기 줄을
-  # 거의 남기지 않아 위 로그 판정이 듣지 않는다. 대신 earnfm 프로세스의 :8443 ESTAB을 센다(Dart도 같다).
+  # 서버 연결 자체를 본다(2026-10-03). 클라이언트가 차단·재접속을 로그로 거의 남기지 않으므로
+  # earnfm 프로세스의 :8443 ESTAB을 센다.
   # EARNFM_NOCONN_MAX초 넘게 연결이 없으면 zombie → 엔진이 먼저 TCP로 방화벽 차단부터 확인한다.
   # 기준 시각은 "마지막으로 연결을 본 때"와 "이번 기동 시각" 중 늦은 쪽이다(재시작 직후 오판 방지).
   c=$(nsenter -t "$pid" -n ss -Htnp state established '( dport = :8443 )' 2>/dev/null | grep -c "pid=$pid,")
@@ -342,32 +329,6 @@ done
 [ -e /etc/default/pawns-host ]  && handle pawns-host  host "$(hb_url /etc/default/pawns-host)"  pawns_health
 [ -e /etc/default/earnfm-host ] && handle earnfm-host host "$(hb_url /etc/default/earnfm-host)" earnfm_health
 [ -e /etc/default/earnapp-host ] && handle earnapp-host host "$(hb_url /etc/default/earnapp-host)" earnapp_health
-
-# ── earnfm 컨트롤 재연결 급증 = 밴 조기경보 ──────────────────────────────────────
-# earnfm이 유럽 컨트롤 서버(websocket)를 반복 재연결하면(그 IP↔서버 국제경로 불안정), 수시간 뒤
-# 'user is limited'로 밴당한다(실측: home04 재연결 63회·home06 47회 → 밴 / 정상 워커 0~1회). 재연결이
-# 밴보다 선행하므로 조기경보로 쓴다. earnfm 자체 로그만 세어(서버에 아무 연결도 안 만듦) 무해하다 —
-# 능동 TCP 폴링은 그 IP에서 연결을 자꾸 열어 서버가 불안정으로 오인, 오히려 밴을 유발할 수 있어 금지.
-# 경보 채널: /etc/default/earnfm-reconn-alert 의 HEARTBEAT_URL(Kuma push). 급증 워커가 있으면 push를
-# 보류해 Kuma가 down→알림. 없으면 push(up). URL 미설정이면 journal 로그로만 남긴다(Kuma 모니터 준비 전).
-RECONN_THRESHOLD=5   # 최근 1h Reconnecting 횟수 임계. 정상 0~1, 밴 직전 수십.
-reconn_alert=""
-for f in /etc/default/earnfm-worker*; do
-  [ -e "$f" ] || continue
-  eid="${f##*/earnfm-worker}"
-  eunit="earnfm-worker@$eid"
-  systemctl is-active --quiet "$eunit" || continue
-  rn=$(journalctl -u "$eunit" --since "-1h" -o cat 2>/dev/null | grep -c 'Reconnecting')
-  [ "${rn:-0}" -ge "$RECONN_THRESHOLD" ] && reconn_alert="$reconn_alert $eunit=$rn"
-done
-alert_url="$(hb_url /etc/default/earnfm-reconn-alert)"
-if [ -n "$reconn_alert" ]; then
-  logger -t proxyware-watchdog "RECONN_ALERT 밴 조기경보(재연결 급증):$reconn_alert"
-  echo "RECONN_ALERT$reconn_alert"          # push 보류 → Kuma down → 알림(URL 설정 시)
-else
-  [ -n "$alert_url" ] && push host "$alert_url"
-  echo "RECONN_OK"
-fi
 
 # ── earnapp IP 터널 실패 경보 ───────────────────────────────────────────────────
 # earnapp 서버는 IP마다 터널 서버를 배정하는데, 가끔 죽은 서버를 준다(2026-09-24 nest w04:
