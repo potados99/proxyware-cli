@@ -2,6 +2,12 @@
 Description=honeygain worker %i
 Requires=worker-net@%i.service
 After=worker-net@%i.service worker-dhcp@%i.service
+# 시계가 맞기 전엔 띄우지 않는다. Pi는 RTC가 없어 부팅 직후 시계가 과거일 수 있고, 그러면
+# 인증이 "Error processing authorisation"으로 실패해 아래 StartLimit에 걸려 영영 멈춘다
+# (2026-10-22 home 재부팅: NTP 동기화가 81분 늦어 7대가 3.5일 정지). time-sync.target은
+# systemd-time-wait-sync가 켜져 있어야 실제로 기다린다(install.sh가 켠다).
+Wants=time-sync.target
+After=time-sync.target
 # exit 1(device 충돌/한도) 재시작 폭주 제한: 600초에 5회 실패하면 정지(failed).
 # 재부팅 후 stale 세션(device already active)은 60초 재시도로 풀려 자동 복구되고,
 # 진짜 device_limit는 5회 후 정지합니다(Kuma down).

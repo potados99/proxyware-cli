@@ -100,6 +100,8 @@ ensure_base() {  # ensure_base <parent-nic>
     systemctl daemon-reload
     systemctl enable --now proxyware-watchdog.timer
     systemctl enable --now earnfm-consentd.service
+    # honeygain이 NTP 동기화 뒤에 뜨도록 time-sync.target을 실제로 기다리게 한다.
+    systemctl enable systemd-time-wait-sync.service
 }
 
 # Kuma 모니터를 보장하고 push URL을 돌려줍니다. (--kuma-* 없으면 빈 문자열)
